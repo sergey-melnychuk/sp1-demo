@@ -36,51 +36,51 @@ The guest does not need network access. It is a pure function over the transcrip
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        HOST (script)                         │
-│                                                               │
-│  TcpStream wrapped in CapturingStream                        │
-│       │ raw bytes captured (both directions)                  │
-│  rustls ClientConnection on top                               │
-│       │ actual TLS handshake with api.coinbase.com            │
-│       ▼                                                       │
-│  TlsTranscriptExtractor                                       │
-│   - parses raw captured bytes into TLS 1.3 records           │
-│   - extracts: certs, CertVerify sig, transcript hash,         │
-│     server ECDH pubkey, encrypted app records                 │
-│   - reads client ephemeral privkey from rustls KeyLog         │
-│       │                                                       │
-│       ▼                                                       │
-│  TlsWitness { ... }  ←── serialised into guest stdin         │
+│                        HOST (script)                        │
+│                                                             │
+│  TcpStream wrapped in CapturingStream                       │
+│       │ raw bytes captured (both directions)                │
+│  rustls ClientConnection on top                             │
+│       │ actual TLS handshake with api.coinbase.com          │
+│       ▼                                                     │
+│  TlsTranscriptExtractor                                     │
+│   - parses raw captured bytes into TLS 1.3 records          │
+│   - extracts: certs, CertVerify sig, transcript hash,       │
+│     server ECDH pubkey, encrypted app records               │
+│   - reads client ephemeral privkey from rustls KeyLog       │
+│       │                                                     │
+│       ▼                                                     │
+│  TlsWitness { ... }  ←── serialised into guest stdin        │
 └─────────────────────────────────────────────────────────────┘
                             │ sp1_zkvm::io::read()
                             ▼
-┌─────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────┐
 │                     GUEST (program)                          │
-│                                                               │
-│  1. verify_cert_chain()                                       │
+│                                                              │
+│  1. verify_cert_chain()                                      │
 │     webpki-roots (hardcoded Mozilla roots) + webpki          │
-│                                                               │
-│  2. verify_cert_verify()                                      │
-│     p256::ecdsa — server signed the transcript with its cert  │
-│     (or rsa if server uses RSA cert)                          │
-│                                                               │
-│  3. derive_traffic_keys()                                     │
+│                                                              │
+│  2. verify_cert_verify()                                     │
+│     p256::ecdsa — server signed the transcript with its cert │
+│     (or rsa if server uses RSA cert)                         │
+│                                                              │
+│  3. derive_traffic_keys()                                    │
 │     X25519 shared secret → HKDF-SHA256 key schedule          │
-│     → server_write_key + server_write_iv                      │
-│     SHA-256 is precompiled in SP1 → this step is cheap        │
-│                                                               │
-│  4. decrypt_records()                                         │
+│     → server_write_key + server_write_iv                     │
+│     SHA-256 is precompiled in SP1 → this step is cheap       │
+│                                                              │
+│  4. decrypt_records()                                        │
 │     AES-128-GCM or ChaCha20-Poly1305 over encrypted records  │
-│                                                               │
-│  5. assert_json_field()                                       │
-│     serde_json pointer lookup + numeric comparison            │
-│                                                               │
-│  6. sp1_zkvm::io::commit() public outputs                     │
-│     - server hostname (from cert CN/SAN)                      │
-│     - field pointer                                           │
-│     - threshold                                               │
-│     - actual value                                            │
-└─────────────────────────────────────────────────────────────┘
+│                                                              │
+│  5. assert_json_field()                                      │
+│     serde_json pointer lookup + numeric comparison           │
+│                                                              │
+│  6. sp1_zkvm::io::commit() public outputs                    │
+│     - server hostname (from cert CN/SAN)                     │
+│     - field pointer                                          │
+│     - threshold                                              │
+│     - actual value                                           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -479,3 +479,81 @@ sp1-demo/
    c. key derivation
    d. decryption
    e. JSON assertion
+
+---
+
+## Current Status (2026-05-14)
+
+### ✅ Completed
+
+| Component | File | Notes |
+|---|---|---|
+| `CapturingKxGroup` | `script/src/capture.rs` | Captures client X25519 private key + server public key |
+| `CapturingStream` | `script/src/capture.rs` | Captures all raw TLS wire bytes |
+| `CapturingKeyLog` | `script/src/keylog.rs` | Captures `SERVER_HANDSHAKE_TRAFFIC_SECRET` for host-side HS decryption |
+| TLS record parser | `script/src/witness.rs` | Parses records, decrypts encrypted handshake, assembles `TlsWitness` |
+| `shared/TlsWitness` | `shared/src/lib.rs` | Serde-serialisable witness struct shared between host and guest |
+| Host TLS connection | `script/src/main.rs` | Real TLS connection using all capturing infrastructure |
+| ECDH + HKDF + AES-GCM | `program/src/main.rs` | Key schedule and decryption running in the guest |
+
+### 🔧 Final 4 Items (being implemented)
+
+The remaining items close the trust loop so the proof cannot be forged:
+
+#### Item 1 — Transcript integrity (in-guest hash computation)
+**Status:** ✅ Implemented  
+`handshake_messages: Vec<Vec<u8>>` added to `TlsWitness`. The host passes raw
+4-byte-header + body bytes for [CH, SH, EE, Cert, CertVerify, ServerFinished].
+The guest computes all required transcript hashes independently:
+- `hash(CH||SH)` → input to `s hs traffic` derivation
+- `hash(CH||SH||EE||Cert)` → input to CertificateVerify signature check
+- `hash(CH||SH||EE||Cert||CertVerify)` → input to Server Finished HMAC
+- `hash(CH||SH||EE||Cert||CertVerify||Finished)` → input to `s ap traffic` derivation
+
+This also fixed the app key derivation bug (was using wrong transcript hash).
+
+#### Item 2 — Server Finished HMAC verification
+**Status:** ✅ Implemented  
+```
+finished_key = HKDF-Expand-Label(server_hs_traffic_secret, "finished", "", 32)
+verify_data  = HMAC-SHA256(finished_key, transcript_before_finished)
+assert verify_data == witness.server_finished_body
+```
+Proves the server completed the handshake and knew the HS traffic secret.
+
+#### Item 3 — Certificate chain verification
+**Status:** ✅ Implemented (P-256 ECDSA certs only)  
+Each cert in the chain is verified against the next cert's public key.
+The last cert is verified against the embedded `webpki-roots` Mozilla root store
+by matching the issuer DER name.
+- Crates: `x509-cert` (DER parsing), `p256::ecdsa` (signature verification), `webpki-roots`
+
+#### Item 4 — CertificateVerify + hostname check
+**Status:** ✅ Implemented  
+- CertVerify: verifies ECDSA-P256 signature over `0x20*64 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_before_cv`
+- Hostname: parses leaf cert's SAN extension, checks `host` against DNS names (supports wildcards)
+
+### Guest verification flow (complete)
+
+```
+witness.handshake_messages
+  → compute transcript hashes at each checkpoint              [SHA-256, in-guest]
+  → verify Server Finished HMAC                               [HMAC-SHA256]
+  → verify cert chain signatures                              [ECDSA-P256]
+  → verify against webpki-roots trust anchors                 [DER comparison + ECDSA]
+  → verify leaf cert SAN contains `host`                      [DER parsing]
+  → verify CertificateVerify signature (leaf cert private key) [ECDSA-P256]
+  → X25519(client_priv, server_pub) + HKDF → app traffic key [X25519 + HKDF-SHA256]
+  → AES-128-GCM decrypt app records                          [AES-GCM]
+  → HTTP response → body → JSON pointer → numeric assertion
+  → commit(host, field, threshold, value)
+```
+
+### Known limitations
+
+- **RSA certs not supported:** Only ECDSA-P256 cert chains work. RSA is rare in modern TLS
+  but would need the `rsa` crate added.
+- **Certificate revocation not checked:** OCSP inside zkVM is too expensive.
+- **Replay not prevented:** A prover could replay an old valid session. Mitigate by
+  asserting on a nonce or timestamp field in the JSON response.
+- **Single cipher suite:** Only `TLS_AES_128_GCM_SHA256` is supported (forced at connection time).
