@@ -484,7 +484,18 @@ sp1-demo/
 
 ## Current Status (2026-05-14)
 
-### ✅ Completed
+### ✅ Fully Working End-to-End
+
+The pipeline passes for `https://blockchain.info/ticker` with field `/USD/last` threshold `1000`.  
+Execution: **~21.2M cycles** (much lower than the earlier estimate of 263M).
+
+```
+cargo run --release --bin sp1-https-json-script -- \
+  --url https://blockchain.info/ticker \
+  --field /USD/last --threshold 1000
+```
+
+All components implemented and `cargo clippy` is clean.
 
 | Component | File | Notes |
 |---|---|---|
@@ -494,44 +505,14 @@ sp1-demo/
 | TLS record parser | `script/src/witness.rs` | Parses records, decrypts encrypted handshake, assembles `TlsWitness` |
 | `shared/TlsWitness` | `shared/src/lib.rs` | Serde-serialisable witness struct shared between host and guest |
 | Host TLS connection | `script/src/main.rs` | Real TLS connection using all capturing infrastructure |
-| ECDH + HKDF + AES-GCM | `program/src/main.rs` | Key schedule and decryption running in the guest |
-
-### 🔧 Final 4 Items (being implemented)
-
-The remaining items close the trust loop so the proof cannot be forged:
-
-#### Item 1 — Transcript integrity (in-guest hash computation)
-**Status:** ✅ Implemented  
-`handshake_messages: Vec<Vec<u8>>` added to `TlsWitness`. The host passes raw
-4-byte-header + body bytes for [CH, SH, EE, Cert, CertVerify, ServerFinished].
-The guest computes all required transcript hashes independently:
-- `hash(CH||SH)` → input to `s hs traffic` derivation
-- `hash(CH||SH||EE||Cert)` → input to CertificateVerify signature check
-- `hash(CH||SH||EE||Cert||CertVerify)` → input to Server Finished HMAC
-- `hash(CH||SH||EE||Cert||CertVerify||Finished)` → input to `s ap traffic` derivation
-
-This also fixed the app key derivation bug (was using wrong transcript hash).
-
-#### Item 2 — Server Finished HMAC verification
-**Status:** ✅ Implemented  
-```
-finished_key = HKDF-Expand-Label(server_hs_traffic_secret, "finished", "", 32)
-verify_data  = HMAC-SHA256(finished_key, transcript_before_finished)
-assert verify_data == witness.server_finished_body
-```
-Proves the server completed the handshake and knew the HS traffic secret.
-
-#### Item 3 — Certificate chain verification
-**Status:** ✅ Implemented (P-256 ECDSA certs only)  
-Each cert in the chain is verified against the next cert's public key.
-The last cert is verified against the embedded `webpki-roots` Mozilla root store
-by matching the issuer DER name.
-- Crates: `x509-cert` (DER parsing), `p256::ecdsa` (signature verification), `webpki-roots`
-
-#### Item 4 — CertificateVerify + hostname check
-**Status:** ✅ Implemented  
-- CertVerify: verifies ECDSA-P256 signature over `0x20*64 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_before_cv`
-- Hostname: parses leaf cert's SAN extension, checks `host` against DNS names (supports wildcards)
+| Transcript integrity | `program/src/main.rs` | All four transcript hashes computed in-guest |
+| Server Finished HMAC | `program/src/main.rs` | Proves server completed handshake |
+| Cert chain verification | `program/src/main.rs` | ECDSA-P256, ECDSA-P384, RSA-PSS, RSA-PKCS1 + webpki-roots |
+| CertificateVerify | `program/src/main.rs` | Multi-scheme: 0x0403, 0x0503, 0x0804, 0x0805, 0x0401 |
+| Hostname check | `program/src/main.rs` | Leaf cert SAN, wildcard support |
+| ECDH + HKDF + AES-GCM | `program/src/main.rs` | Full key schedule and app record decryption |
+| Chunked HTTP decoder | `program/src/main.rs` | `unchunk()` — handles Transfer-Encoding: chunked |
+| Session ticket filter | `program/src/main.rs` | Skips NewSessionTicket records (inner_ct=22) |
 
 ### Guest verification flow (complete)
 
@@ -539,21 +520,55 @@ by matching the issuer DER name.
 witness.handshake_messages
   → compute transcript hashes at each checkpoint              [SHA-256, in-guest]
   → verify Server Finished HMAC                               [HMAC-SHA256]
-  → verify cert chain signatures                              [ECDSA-P256]
-  → verify against webpki-roots trust anchors                 [DER comparison + ECDSA]
+  → verify cert chain signatures                              [ECDSA-P256/P384/RSA]
+  → verify against webpki-roots trust anchors                 [DER byte comparison]
+      Strategy A: cert subject matches anchor
+      Strategy B: last cert issuer matches anchor (cross-signed roots)
   → verify leaf cert SAN contains `host`                      [DER parsing]
-  → verify CertificateVerify signature (leaf cert private key) [ECDSA-P256]
+  → verify CertificateVerify signature (leaf cert private key) [multi-scheme]
   → X25519(client_priv, server_pub) + HKDF → app traffic key [X25519 + HKDF-SHA256]
-  → AES-128-GCM decrypt app records                          [AES-GCM]
-  → HTTP response → body → JSON pointer → numeric assertion
+  → AES-128-GCM decrypt app records, filter session tickets   [AES-GCM]
+  → unchunk HTTP body → JSON pointer → numeric assertion
   → commit(host, field, threshold, value)
 ```
 
-### Known limitations
+### Implementation notes
 
-- **RSA certs not supported:** Only ECDSA-P256 cert chains work. RSA is rare in modern TLS
-  but would need the `rsa` crate added.
-- **Certificate revocation not checked:** OCSP inside zkVM is too expensive.
-- **Replay not prevented:** A prover could replay an old valid session. Mitigate by
-  asserting on a nonce or timestamp field in the JSON response.
-- **Single cipher suite:** Only `TLS_AES_128_GCM_SHA256` is supported (forced at connection time).
+- **webpki-roots 0.26 format:** `TrustAnchor::subject` and `subject_public_key_info` store
+  the *inner content* of their DER SEQUENCE — without the outer `0x30` wrapper. Trust anchor
+  matching uses raw DER byte comparison after stripping wrappers from the chain's DER. The
+  `parse_anchor_spki()` helper re-wraps the content into a full SEQUENCE before calling
+  `SubjectPublicKeyInfoOwned::from_der`.
+
+- **Cross-signed certificate chains:** Some servers (e.g. blockchain.info) include a root cert
+  in the chain whose SUBJECT is in the trust store (DigiCert Global Root G2) but whose ISSUER
+  points to an older root not in webpki-roots. `find_trust_anchor` uses two strategies:
+  (A) find any cert whose subject matches a trust anchor, (B) check if the last cert's issuer
+  matches a trust anchor (for chains that don't include the root at all).
+
+- **TLS NewSessionTicket records:** After the handshake the server sends NewSessionTicket
+  as encrypted ApplicationData records with inner content type 22 (Handshake), not 23.
+  These are filtered before appending to the HTTP plaintext.
+
+### Known limitations / follow-ups
+
+- **Real STARK proof requires 32–64 GB RAM.** Running `--prove` on a laptop is OOM-killed.
+  Use `SP1_PROVER=mock` for development or submit to the Succinct prover network.
+- **Certificate revocation not checked.** OCSP inside zkVM is prohibitively expensive.
+- **Replay not prevented.** A prover could reuse an old valid session transcript. Mitigation:
+  assert on a timestamp or nonce field in the JSON response (e.g. `/timestamp`).
+- **Single cipher suite.** Only `TLS_AES_128_GCM_SHA256` is negotiated. ChaCha20-Poly1305
+  and AES-256-GCM would need additional decryption paths in the guest.
+- **No ChaCha20-Poly1305 / AES-256 support.** The script forces AES-128-GCM but if the
+  server rejects it the connection will fail.
+
+### Potential next steps
+
+1. **Succinct network integration** — submit proof job via `SP1_PROVER=network` to avoid
+   local RAM requirements.
+2. **Timestamp / replay prevention** — add `--nonce-field` CLI arg; guest asserts the JSON
+   field equals a fresh nonce or is within an acceptable time window.
+3. **On-chain verifier** — generate a Solidity verifier with `sp1-sdk`'s `evm` feature and
+   post proofs to a smart contract.
+4. **Broader URL support** — test against more endpoints; handle servers that don't support
+   TLS 1.3-only or require SNI fallback.
