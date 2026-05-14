@@ -7,33 +7,42 @@ cargo prove build
 cd ../script
 cargo build
 
-## Execute only
-cargo run --release -- \
-  --url https://api.coinbase.com/v2/prices/BTC-USD/spot \
-  --field /data/amount \
-  --threshold 50000
 
-## Output:
-Response body: {"data":{"amount":"79652.885","base":"BTC","currency":"USD"}}
+## Run only (no proof)
+cargo run --release --bin sp1-https-json-script -- \
+  --url "https://blockchain.info/ticker" \
+  --field "/USD/last" \
+  --threshold 1000
+<snip>
+Response body: ae3
+{"snip":{},"USD":{"15m":79349.99,"last":79349.99,"buy":79349.99,"sell":79349.99,"symbol":"USD"}}
+0
+debug: inbound=10837 bytes, outbound=480 bytes, hs_secret=32 bytes
+TLS witness assembled: 3 certs, 7 app records, cv_msg 260 bytes
 Execution succeeded (no proof generated).
-   field:     /data/amount
-   threshold: 50000
-   value:     79652.885
-   cycles:    20002
+   host:      blockchain.info
+   field:     /USD/last
+   threshold: 1000
+   value:     79349.99
+   cycles:    21202056
 
-## Prove and validate
-cargo run --release -- \
-  --url https://api.coinbase.com/v2/prices/BTC-USD/spot \
-  --field /data/amount \
-  --threshold 50000 \
+
+## Run using mock prover (note: SP1_PROVER=mock)
+SP1_PROVER=mock cargo run --release --bin sp1-https-json-script -- \
+  --url "https://blockchain.info/ticker" \
+  --field "/USD/last" \
+  --threshold 1000 \
   --prove
-
-## Output:
-## proof.bin: 1272605 bytes
-Response body: {"data":{"amount":"79659.535","base":"BTC","currency":"USD"}}
+<snip>
+Response body: ad7
+{"snip":{},"USD":{"15m":79269.52,"last":79269.52,"buy":79269.52,"sell":79269.52,"symbol":"USD"}}
+0
+debug: inbound=10825 bytes, outbound=480 bytes, hs_secret=32 bytes
+TLS witness assembled: 3 certs, 7 app records, cv_msg 260 bytes
 Proof saved to proof.bin
 Proof verified.
-   field:     /data/amount
-   threshold: 50000
-   value:     79659.535
+   host:      blockchain.info
+   field:     /USD/last
+   threshold: 1000
+   value:     79269.52
 ```

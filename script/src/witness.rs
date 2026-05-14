@@ -119,7 +119,7 @@ fn decrypt_record(
     record: &RawRecord,
 ) -> anyhow::Result<(Vec<u8>, u8)> {
     let nonce_bytes = per_record_nonce(iv, seq);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     // AAD = the 5-byte TLS record header of the *outer* ApplicationData record.
     let aad = {
@@ -139,11 +139,13 @@ fn decrypt_record(
     buf.truncate(tag_start);
 
     cipher
-        .decrypt_in_place_detached(nonce, &aad, &mut buf, &tag.into())
+        .decrypt_in_place_detached(&nonce, &aad, &mut buf, &tag.into())
         .map_err(|_| anyhow::anyhow!("AES-GCM authentication failed (seq={seq})"))?;
 
     // Strip the inner content-type byte (last byte of plaintext).
-    let inner_ct = *buf.last().ok_or_else(|| anyhow::anyhow!("empty decrypted record"))?;
+    let inner_ct = *buf
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("empty decrypted record"))?;
     buf.pop();
 
     Ok((buf, inner_ct))
@@ -153,8 +155,6 @@ fn decrypt_record(
 // Handshake message parsing
 // ---------------------------------------------------------------------------
 
-const HS_CLIENT_HELLO: u8 = 1;
-const HS_SERVER_HELLO: u8 = 2;
 const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
 const HS_CERTIFICATE: u8 = 11;
 const HS_CERTIFICATE_VERIFY: u8 = 15;
@@ -182,7 +182,10 @@ fn parse_handshake_messages(data: &[u8]) -> anyhow::Result<Vec<HandshakeMsg>> {
         pos += 4;
 
         if data.len() - pos < length {
-            anyhow::bail!("truncated handshake body: need {length}, have {}", data.len() - pos);
+            anyhow::bail!(
+                "truncated handshake body: need {length}, have {}",
+                data.len() - pos
+            );
         }
 
         msgs.push(HandshakeMsg {

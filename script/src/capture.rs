@@ -143,8 +143,7 @@ pub fn make_capturing_provider(
 ) -> rustls::crypto::CryptoProvider {
     // Box::leak gives us a &'static reference, which CryptoProvider requires.
     // This leaks one allocation per connection — acceptable for our use case.
-    let kx: &'static dyn SupportedKxGroup =
-        Box::leak(Box::new(CapturingKxGroup { captured }));
+    let kx: &'static dyn SupportedKxGroup = Box::leak(Box::new(CapturingKxGroup { captured }));
 
     rustls::crypto::CryptoProvider {
         kx_groups: vec![kx],

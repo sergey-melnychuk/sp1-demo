@@ -29,7 +29,12 @@ pub struct CapturingKeyLog {
 impl CapturingKeyLog {
     pub fn new() -> (Self, Arc<Mutex<CapturedSecrets>>) {
         let secrets = Arc::new(Mutex::new(CapturedSecrets::default()));
-        (Self { secrets: secrets.clone() }, secrets)
+        (
+            Self {
+                secrets: secrets.clone(),
+            },
+            secrets,
+        )
     }
 }
 

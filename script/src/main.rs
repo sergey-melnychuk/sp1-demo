@@ -46,7 +46,11 @@ fn main() -> Result<()> {
     let url = url::Url::parse(&args.url).context("invalid URL")?;
     let host = url.host_str().context("URL has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(443);
-    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
     let query_path = match url.query() {
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
@@ -61,13 +65,12 @@ fn main() -> Result<()> {
 
     // Force AES-128-GCM-SHA256 so the witness parser knows the exact cipher.
     let mut provider = make_capturing_provider(kx_captured.clone());
-    provider.cipher_suites =
-        vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
 
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         })
         .with_no_client_auth();
 
@@ -155,8 +158,8 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
 
     let mut stdin = SP1Stdin::new();
-    stdin.write(&tls_witness);      // full TLS witness for in-guest verification
-    stdin.write(&host);             // hostname (committed as public output)
+    stdin.write(&tls_witness); // full TLS witness for in-guest verification
+    stdin.write(&host); // hostname (committed as public output)
     stdin.write(&args.field);
     stdin.write(&args.threshold);
 
@@ -168,8 +171,7 @@ fn main() -> Result<()> {
 
     if args.prove {
         let pk = prover.setup(ELF)?;
-        let proof: SP1ProofWithPublicValues =
-            prover.prove(&pk, stdin).compressed().run()?;
+        let proof: SP1ProofWithPublicValues = prover.prove(&pk, stdin).compressed().run()?;
         let proof_path = "proof.bin";
         proof.save(proof_path)?;
         println!("Proof saved to {proof_path}");

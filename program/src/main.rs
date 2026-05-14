@@ -10,11 +10,10 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::{signature::Verifier as EcVerifier, DerSignature, VerifyingKey};
 use p384::ecdsa::{
-    signature::Verifier as P384Verifier,
-    DerSignature as P384DerSignature,
+    signature::Verifier as P384Verifier, DerSignature as P384DerSignature,
     VerifyingKey as P384VerifyingKey,
 };
-use rsa::{pkcs8::DecodePublicKey, pkcs1v15, pss, RsaPublicKey};
+use rsa::{pkcs1v15, pkcs8::DecodePublicKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 use sp1_https_json_shared::{PublicClaim, TlsWitness};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -91,8 +90,12 @@ pub fn main() {
     let (master_secret, _) = Hkdf::<Sha256>::extract(Some(&derived2), &[0u8; 32]);
 
     // server_application_traffic_secret_0
-    let server_app_secret =
-        expand_label(&master_secret, "s ap traffic", &transcript_after_finished, 32);
+    let server_app_secret = expand_label(
+        &master_secret,
+        "s ap traffic",
+        &transcript_after_finished,
+        32,
+    );
 
     // -----------------------------------------------------------------------
     // 4. Verify Server Finished (proves the server knew the HS key).
@@ -103,7 +106,7 @@ pub fn main() {
     let expected_verify_data = mac.finalize().into_bytes();
 
     assert_eq!(
-        expected_verify_data.as_slice(),
+        expected_verify_data.as_ref() as &[u8],
         witness.server_finished_body.as_slice(),
         "Server Finished HMAC verification failed"
     );
@@ -175,7 +178,8 @@ pub fn main() {
             // ecdsa_secp256r1_sha256
             let vk = VerifyingKey::from_sec1_bytes(leaf_pk).expect("leaf cert not P-256");
             let sig = DerSignature::try_from(sig_bytes).expect("invalid ECDSA-P256 sig DER");
-            vk.verify(&signed_content, &sig).expect("CertificateVerify ECDSA-P256 sig invalid");
+            vk.verify(&signed_content, &sig)
+                .expect("CertificateVerify ECDSA-P256 sig invalid");
         }
         0x0503 => {
             // ecdsa_secp384r1_sha384
@@ -186,8 +190,8 @@ pub fn main() {
         }
         0x0804 => {
             // rsa_pss_rsae_sha256
-            use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVk};
             use der::Encode;
+            use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVk};
             let spki_der = leaf_spki.to_der().expect("encode leaf SPKI");
             let pk = RsaPublicKey::from_public_key_der(&spki_der).expect("parse RSA leaf key");
             let vk = PssVk::<Sha256>::new(pk);
@@ -197,9 +201,9 @@ pub fn main() {
         }
         0x0805 => {
             // rsa_pss_rsae_sha384
-            use sha2::Sha384;
-            use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVk};
             use der::Encode;
+            use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVk};
+            use sha2::Sha384;
             let spki_der = leaf_spki.to_der().expect("encode leaf SPKI");
             let pk = RsaPublicKey::from_public_key_der(&spki_der).expect("parse RSA leaf key");
             let vk = PssVk::<Sha384>::new(pk);
@@ -273,8 +277,7 @@ pub fn main() {
     // Decode chunked transfer encoding if present (strip hex chunk sizes).
     let body = unchunk(raw_body);
 
-    let json: serde_json::Value =
-        serde_json::from_str(&body).expect("body is not valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body is not valid JSON");
 
     let field_value = json
         .pointer(&field)
@@ -308,12 +311,15 @@ pub fn main() {
 // OID strings for signature algorithms
 const OID_ECDSA_SHA256: &str = "1.2.840.10045.4.3.2";
 const OID_ECDSA_SHA384: &str = "1.2.840.10045.4.3.3";
-const OID_RSA_SHA256:   &str = "1.2.840.113549.1.1.11";
-const OID_RSA_SHA384:   &str = "1.2.840.113549.1.1.12";
+const OID_RSA_SHA256: &str = "1.2.840.113549.1.1.11";
+const OID_RSA_SHA384: &str = "1.2.840.113549.1.1.12";
 
 /// Verify `cert`'s signature using the parsed SPKI of its issuer.
 /// Dispatches on the cert's signature algorithm OID (ECDSA-P256 or RSA PKCS#1v1.5).
-fn verify_cert_signature(cert: &Certificate, issuer_spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) {
+fn verify_cert_signature(
+    cert: &Certificate,
+    issuer_spki: &x509_cert::spki::SubjectPublicKeyInfoOwned,
+) {
     use der::Encode;
     let tbs_der = cert.tbs_certificate.to_der().expect("encode TBS");
     let sig_bytes = cert.signature.raw_bytes();
@@ -415,20 +421,18 @@ fn parse_anchor_spki(content: &[u8]) -> x509_cert::spki::SubjectPublicKeyInfoOwn
         full.push(len as u8);
     }
     full.extend_from_slice(content);
-    x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(&full)
-        .expect("parse trust anchor SPKI")
+    x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(&full).expect("parse trust anchor SPKI")
 }
 
-enum NameField { Subject, Issuer }
+enum NameField {
+    Subject,
+    Issuer,
+}
 
 /// Extract the raw content bytes (inner SEQUENCE content, no outer tag/length)
 /// of either the issuer or subject Name from a DER-encoded Certificate at
 /// `chain_ders[idx]`.
-fn raw_name_content<'a>(
-    chain_ders: &'a [Vec<u8>],
-    idx: usize,
-    field: NameField,
-) -> Option<&'a [u8]> {
+fn raw_name_content(chain_ders: &[Vec<u8>], idx: usize, field: NameField) -> Option<&[u8]> {
     let cert_der = &chain_ders[idx];
     let cert_content = der_unwrap_sequence(cert_der)?;
     let (tbs_tlv, _) = der_next_tlv(cert_content)?;
@@ -463,7 +467,6 @@ fn raw_name_content<'a>(
     der_unwrap_sequence(name_tlv)
 }
 
-
 /// Check that the leaf cert's SAN contains `host` (exact or wildcard match).
 fn verify_hostname(cert: &Certificate, host: &str) {
     use x509_cert::ext::pkix::{name::GeneralName, SubjectAltName};
@@ -497,47 +500,19 @@ fn verify_hostname(cert: &Certificate, host: &str) {
     assert!(matched, "hostname '{}' not in cert SAN", host);
 }
 
-/// Extract the raw public key bytes from a DER-encoded SubjectPublicKeyInfo.
-/// Returns the BIT STRING payload (drops the leading 0x00 unused-bits byte).
-fn extract_spki_key_bytes(spki_der: &[u8]) -> Option<&[u8]> {
-    // SPKI = SEQUENCE { AlgorithmIdentifier, BIT STRING }
-    // Walk the outer SEQUENCE, skip the inner AlgorithmIdentifier SEQUENCE,
-    // then read the BIT STRING.
-    let spki = der_unwrap_sequence(spki_der)?;
-    let (algo_seq, rest) = der_next_tlv(spki)?;
-    // algo_seq tag must be SEQUENCE (0x30) — just skip it
-    let _ = algo_seq;
-    let (bit_string_tlv, _) = der_next_tlv(rest)?;
-    // BIT STRING tag is 0x03; first content byte is unused-bits count (0x00)
-    if bit_string_tlv[0] != 0x03 {
-        return None;
-    }
-    let (_, value) = der_tlv_value(bit_string_tlv)?;
-    // Drop leading unused-bits byte
-    value.get(1..)
-}
-
-/// Return the value bytes of a DER TLV.
-fn der_tlv_value(tlv: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (_, rest) = der_next_tlv(tlv)?;
-    let len = tlv.len() - rest.len();
-    // re-parse to get value
-    let tag_len = if tlv[1] & 0x80 == 0 {
-        2
-    } else {
-        2 + (tlv[1] & 0x7f) as usize
-    };
-    Some((&tlv[tag_len..], rest))
-}
-
 /// Unwrap a DER SEQUENCE, returning its content bytes.
 fn der_unwrap_sequence(der: &[u8]) -> Option<&[u8]> {
     if der.first() != Some(&0x30) {
         return None;
     }
-    der_next_tlv(der).map(|(_, rest)| &der[..der.len() - rest.len()])
+    der_next_tlv(der)
+        .map(|(_, rest)| &der[..der.len() - rest.len()])
         .map(|seq| {
-            let tag_len = if seq[1] & 0x80 == 0 { 2 } else { 2 + (seq[1] & 0x7f) as usize };
+            let tag_len = if seq[1] & 0x80 == 0 {
+                2
+            } else {
+                2 + (seq[1] & 0x7f) as usize
+            };
             &seq[tag_len..]
         })
 }
@@ -588,12 +563,9 @@ fn hostname_matches(pattern: &str, host: &str) -> bool {
 fn unchunk(body: &str) -> String {
     let mut out = String::new();
     let mut s = body;
-    loop {
+    while let Some(p) = s.find("\r\n") {
         // Find the chunk-size line
-        let crlf = match s.find("\r\n") {
-            Some(p) => p,
-            None => break,
-        };
+        let crlf = p;
         let size_str = s[..crlf].trim();
         // Chunk size might have extensions after ';' — ignore them
         let size_hex = size_str.split(';').next().unwrap_or("").trim();
@@ -615,7 +587,11 @@ fn unchunk(body: &str) -> String {
             s = &s[2..];
         }
     }
-    if out.is_empty() { body.to_string() } else { out }
+    if out.is_empty() {
+        body.to_string()
+    } else {
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
