@@ -93,7 +93,7 @@ SP1_PROVER=mock SP1_SKIP_PROGRAM_BUILD=1 cargo run --release \
 
 Output: `proof.bin` (proof + public values). The script verifies the proof immediately after generation and prints `Proof verified.`
 
-### Generate a real STARK proof (requires ~32–64 GB RAM)
+### Generate a real STARK proof (requires ~32 GB RAM)
 
 ```bash
 SP1_SKIP_PROGRAM_BUILD=1 cargo run --release \
@@ -105,7 +105,7 @@ SP1_SKIP_PROGRAM_BUILD=1 cargo run --release \
   --prove
 ```
 
-On a machine without enough RAM this will be OOM-killed. Use the mock prover or the Succinct prover network for local development.
+Verified working on a 32 GB machine. On machines with less RAM this will be OOM-killed — use the mock prover or the Succinct prover network instead.
 
 ## CLI flags
 
@@ -139,7 +139,7 @@ sp1-demo/
 
 ## Limitations
 
-- **Real proof RAM:** A real STARK proof requires 32–64 GB RAM. Use `SP1_PROVER=mock` locally.
+- **Real proof RAM:** A real STARK proof requires ~32 GB RAM (verified on NUC with 32 GB). Use `SP1_PROVER=mock` on smaller machines.
 - **Cipher suite:** Only `TLS_AES_128_GCM_SHA256` is negotiated. ChaCha20-Poly1305 and AES-256-GCM
   are not yet supported in the guest decryption path.
 - **Replay:** The proof does not prevent replaying an old session. For high-stakes use, add a

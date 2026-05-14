@@ -54,7 +54,7 @@ The prover is a courier for the witness, not a trusted party. The verifier trust
 
 ## Proving
 
-- [ ] **Succinct prover network integration** — real STARK proof requires 32–64 GB RAM and gets OOM-killed on a laptop. Wire up `SP1_PROVER=network` and document the Succinct network flow in the README.
+- [ ] **Succinct prover network integration** — real STARK proof works on 32 GB RAM (verified on NUC). Wire up `SP1_PROVER=network` as an alternative for machines with less RAM, and document the flow in the README.
 
 - [ ] **Investigate the cycle count gap** — actual execution is 21.2M cycles vs. the 263M estimate. SP1 likely has P-256 precompiles not accounted for in the original estimate. Understand what's precompiled to inform future optimization.
 
