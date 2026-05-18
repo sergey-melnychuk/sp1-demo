@@ -1,5 +1,6 @@
 [workspace]
-members = ["program", "script", "shared"]
+members = ["guest", "host", "common"]
+default-members = ["host"]
 resolver = "2"
 
 [patch.crates-io]

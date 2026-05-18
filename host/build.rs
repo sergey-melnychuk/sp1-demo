@@ -3,16 +3,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=../program/src");
-    println!("cargo:rerun-if-changed=../program/Cargo.toml");
+    println!("cargo:rerun-if-changed=../guest/src");
+    println!("cargo:rerun-if-changed=../guest/Cargo.toml");
 
     let elf_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join(
-        "../target/elf-compilation/riscv64im-succinct-zkvm-elf/release/sp1-https-json-program",
+        "../target/elf-compilation/riscv64im-succinct-zkvm-elf/release/sp1-demo-guest",
     );
 
-    let skip = env::var("SP1_SKIP_PROGRAM_BUILD").is_ok();
-
-    if !skip && !elf_path.exists() {
+    if !elf_path.exists() {
         // Only build when the ELF is missing; set SP1_SKIP_PROGRAM_BUILD=1 to
         // skip (e.g. for `cargo clippy` / `cargo check` after initial build).
         let prove_bin = home_sp1_bin().join("cargo-prove");
@@ -24,7 +22,7 @@ fn main() {
 
         let status = Command::new(&cargo_prove)
             .args(["prove", "build"])
-            .current_dir("../program")
+            .current_dir("../guest")
             .status()
             .unwrap_or_else(|_| panic!("failed to run {cargo_prove}"));
         assert!(status.success(), "cargo prove build failed");
@@ -39,7 +37,7 @@ fn main() {
     };
 
     println!(
-        "cargo:rustc-env=SP1_ELF_sp1-https-json-program={}",
+        "cargo:rustc-env=SP1_ELF_sp1-demo-guest={}",
         elf.display()
     );
 }

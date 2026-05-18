@@ -1,6 +1,3 @@
-mod capture;
-mod keygen;
-
 use std::net::TcpStream;
 use std::sync::Arc;
 
@@ -12,10 +9,10 @@ use sp1_sdk::{
     include_elf, ProvingKey, SP1ProofWithPublicValues,
 };
 
-use capture::{make_provider, CapturingStream};
-use sp1_https_json_shared::{PublicClaim, TlsWitness};
+use sp1_demo_host::{crypto::make_provider, stream::CapturingStream};
+use sp1_demo_common::{PublicClaim, TlsWitness};
 
-const ELF: Elf = include_elf!("sp1-https-json-program");
+const ELF: Elf = include_elf!("sp1-demo-guest");
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -48,11 +45,18 @@ fn main() -> Result<()> {
         None => path.to_string(),
     };
 
+    fn keygen() -> ([u8; 32], [u8; 32]) {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let esk = StaticSecret::random_from_rng(rand::thread_rng());
+        let epk = PublicKey::from(&esk);
+        (esk.to_bytes(), *epk.as_bytes())
+    }
+
     // -----------------------------------------------------------------------
     // Phase 1 — Key generation.
     // esk_client stays in memory; epk_client is injected into ClientHello.
     // -----------------------------------------------------------------------
-    let (esk_client, epk_client) = keygen::generate();
+    let (esk_client, epk_client) = keygen();
     eprintln!("phase 1: epk_client generated ({} bytes)", epk_client.len());
 
     // -----------------------------------------------------------------------

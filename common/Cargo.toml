@@ -1,5 +1,5 @@
 [package]
-name = "sp1-https-json-shared"
+name = "sp1-demo-common"
 version = "0.1.0"
 edition = "2021"
 

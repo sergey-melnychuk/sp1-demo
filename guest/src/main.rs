@@ -15,7 +15,7 @@ use p384::ecdsa::{
 };
 use rsa::{pkcs1v15, pkcs8::DecodePublicKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
-use sp1_https_json_shared::{PublicClaim, TlsWitness};
+use sp1_demo_common::{PublicClaim, TlsWitness};
 use x25519_dalek::{PublicKey, StaticSecret};
 use x509_cert::Certificate;
 
