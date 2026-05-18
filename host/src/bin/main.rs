@@ -9,8 +9,8 @@ use sp1_sdk::{
     include_elf, ProvingKey, SP1ProofWithPublicValues,
 };
 
-use sp1_demo_host::{crypto::make_provider, stream::CapturingStream};
 use sp1_demo_common::{PublicClaim, TlsWitness};
+use sp1_demo_host::{crypto::make_provider, stream::CapturingStream};
 
 const ELF: Elf = include_elf!("sp1-demo-guest");
 
@@ -39,7 +39,11 @@ fn main() -> Result<()> {
     let url = url::Url::parse(&args.url).context("invalid URL")?;
     let host = url.host_str().context("URL has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(443);
-    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
     let query_path = match url.query() {
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
@@ -100,7 +104,11 @@ fn main() -> Result<()> {
     joined.read_to_end(&mut response_bytes)?;
 
     let response_str = String::from_utf8_lossy(&response_bytes);
-    let body = response_str.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let body = response_str
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
     println!("Response: {body}");
 
     eprintln!(

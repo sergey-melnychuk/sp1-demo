@@ -6,9 +6,8 @@ fn main() {
     println!("cargo:rerun-if-changed=../guest/src");
     println!("cargo:rerun-if-changed=../guest/Cargo.toml");
 
-    let elf_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join(
-        "../target/elf-compilation/riscv64im-succinct-zkvm-elf/release/sp1-demo-guest",
-    );
+    let elf_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../target/elf-compilation/riscv64im-succinct-zkvm-elf/release/sp1-demo-guest");
 
     if !elf_path.exists() {
         // Only build when the ELF is missing; set SP1_SKIP_PROGRAM_BUILD=1 to
@@ -36,10 +35,7 @@ fn main() {
         elf_path
     };
 
-    println!(
-        "cargo:rustc-env=SP1_ELF_sp1-demo-guest={}",
-        elf.display()
-    );
+    println!("cargo:rustc-env=SP1_ELF_sp1-demo-guest={}", elf.display());
 }
 
 fn home_sp1_bin() -> PathBuf {

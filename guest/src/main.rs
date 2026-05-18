@@ -577,8 +577,7 @@ fn parse_handshake_messages(data: &[u8]) -> Result<Vec<HandshakeMsg>, &'static s
             return Err("truncated handshake header");
         }
         let msg_type = data[pos];
-        let length =
-            u32::from_be_bytes([0, data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let length = u32::from_be_bytes([0, data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if data.len() - pos < length {
             return Err("truncated handshake body");
@@ -610,8 +609,7 @@ fn parse_cert_message(body: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
     if body.len() - pos < 3 {
         return Err("truncated certificate_list length");
     }
-    let list_len =
-        u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
+    let list_len = u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
     pos += 3;
     let list_end = pos + list_len;
     let mut certs = Vec::new();
@@ -619,8 +617,7 @@ fn parse_cert_message(body: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
         if list_end - pos < 3 {
             return Err("truncated cert_data length");
         }
-        let cert_len =
-            u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
+        let cert_len = u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
         pos += 3;
         if list_end - pos < cert_len {
             return Err("truncated cert_data");
@@ -657,7 +654,11 @@ fn parse_cert_message(body: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
 fn parse_client_hello_key_share(outbound: &[u8]) -> Option<[u8; 32]> {
     // Find the ClientHello record (content_type = 22, plaintext handshake).
     let records = parse_records(outbound);
-    let ch_payload = records.iter().find(|r| r.content_type == 22)?.payload.clone();
+    let ch_payload = records
+        .iter()
+        .find(|r| r.content_type == 22)?
+        .payload
+        .clone();
 
     // ch_payload = one or more handshake messages; first should be ClientHello (type 1).
     let msgs = parse_handshake_messages(&ch_payload).ok()?;
@@ -670,19 +671,27 @@ fn parse_client_hello_key_share(outbound: &[u8]) -> Option<[u8; 32]> {
     // client_random (32)
     pos += 32;
     // session_id
-    if pos >= body.len() { return None; }
+    if pos >= body.len() {
+        return None;
+    }
     let sid_len = body[pos] as usize;
     pos += 1 + sid_len;
     // cipher_suites
-    if pos + 2 > body.len() { return None; }
+    if pos + 2 > body.len() {
+        return None;
+    }
     let cs_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2 + cs_len;
     // compression_methods
-    if pos >= body.len() { return None; }
+    if pos >= body.len() {
+        return None;
+    }
     let cm_len = body[pos] as usize;
     pos += 1 + cm_len;
     // extensions_len
-    if pos + 2 > body.len() { return None; }
+    if pos + 2 > body.len() {
+        return None;
+    }
     let ext_total = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
     let ext_end = pos + ext_total;
@@ -698,11 +707,15 @@ fn parse_key_share_client(exts: &[u8]) -> Option<[u8; 32]> {
         let ext_type = u16::from_be_bytes([exts[pos], exts[pos + 1]]);
         let ext_len = u16::from_be_bytes([exts[pos + 2], exts[pos + 3]]) as usize;
         pos += 4;
-        if pos + ext_len > exts.len() { break; }
+        if pos + ext_len > exts.len() {
+            break;
+        }
         let ext_data = &exts[pos..pos + ext_len];
         if ext_type == 0x0033 {
             // client_shares list: 2-byte list_len, then entries
-            if ext_data.len() < 2 { return None; }
+            if ext_data.len() < 2 {
+                return None;
+            }
             let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
             let mut epos = 2;
             let list_end = 2 + list_len;
@@ -710,7 +723,9 @@ fn parse_key_share_client(exts: &[u8]) -> Option<[u8; 32]> {
                 let group = u16::from_be_bytes([ext_data[epos], ext_data[epos + 1]]);
                 let klen = u16::from_be_bytes([ext_data[epos + 2], ext_data[epos + 3]]) as usize;
                 epos += 4;
-                if epos + klen > ext_data.len() { break; }
+                if epos + klen > ext_data.len() {
+                    break;
+                }
                 if group == 0x001d && klen == 32 {
                     let mut key = [0u8; 32];
                     key.copy_from_slice(&ext_data[epos..epos + 32]);
@@ -731,7 +746,11 @@ fn parse_key_share_client(exts: &[u8]) -> Option<[u8; 32]> {
 ///   { 2-byte NamedGroup, 2-byte key_len, key_bytes }
 fn parse_server_hello_key_share(inbound: &[u8]) -> Option<[u8; 32]> {
     let records = parse_records(inbound);
-    let sh_payload = records.iter().find(|r| r.content_type == 22)?.payload.clone();
+    let sh_payload = records
+        .iter()
+        .find(|r| r.content_type == 22)?
+        .payload
+        .clone();
 
     let msgs = parse_handshake_messages(&sh_payload).ok()?;
     let sh = msgs.iter().find(|m| m.msg_type == 2)?; // ServerHello
@@ -743,7 +762,9 @@ fn parse_server_hello_key_share(inbound: &[u8]) -> Option<[u8; 32]> {
     // server_random (32)
     pos += 32;
     // session_id
-    if pos >= body.len() { return None; }
+    if pos >= body.len() {
+        return None;
+    }
     let sid_len = body[pos] as usize;
     pos += 1 + sid_len;
     // cipher_suite (2)
@@ -751,7 +772,9 @@ fn parse_server_hello_key_share(inbound: &[u8]) -> Option<[u8; 32]> {
     // compression_method (1)
     pos += 1;
     // extensions_len
-    if pos + 2 > body.len() { return None; }
+    if pos + 2 > body.len() {
+        return None;
+    }
     let ext_total = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
     let ext_end = pos + ext_total;
@@ -767,11 +790,15 @@ fn parse_key_share_server(exts: &[u8]) -> Option<[u8; 32]> {
         let ext_type = u16::from_be_bytes([exts[pos], exts[pos + 1]]);
         let ext_len = u16::from_be_bytes([exts[pos + 2], exts[pos + 3]]) as usize;
         pos += 4;
-        if pos + ext_len > exts.len() { break; }
+        if pos + ext_len > exts.len() {
+            break;
+        }
         let ext_data = &exts[pos..pos + ext_len];
         if ext_type == 0x0033 {
             // Single entry: 2-byte group + 2-byte key_len + key
-            if ext_data.len() < 4 { return None; }
+            if ext_data.len() < 4 {
+                return None;
+            }
             let group = u16::from_be_bytes([ext_data[0], ext_data[1]]);
             let klen = u16::from_be_bytes([ext_data[2], ext_data[3]]) as usize;
             if group == 0x001d && klen == 32 && ext_data.len() >= 4 + 32 {
@@ -1028,7 +1055,11 @@ fn unchunk(body: &str) -> String {
             s = &s[2..];
         }
     }
-    if out.is_empty() { body.to_string() } else { out }
+    if out.is_empty() {
+        body.to_string()
+    } else {
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------

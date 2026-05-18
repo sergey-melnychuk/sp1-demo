@@ -59,8 +59,7 @@ impl ActiveKeyExchange for ExternalActiveKx {
 /// Build a `CryptoProvider` that uses `esk_client` for X25519 key exchange
 /// and falls back to ring for everything else.
 pub fn make_provider(esk_client: [u8; 32]) -> rustls::crypto::CryptoProvider {
-    let kx: &'static dyn SupportedKxGroup =
-        Box::leak(Box::new(ExternalKxGroup { esk_client }));
+    let kx: &'static dyn SupportedKxGroup = Box::leak(Box::new(ExternalKxGroup { esk_client }));
     rustls::crypto::CryptoProvider {
         kx_groups: vec![kx],
         ..rustls::crypto::ring::default_provider()
