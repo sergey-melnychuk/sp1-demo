@@ -57,7 +57,14 @@ fn main() -> Result<()> {
 
     // -----------------------------------------------------------------------
     // Phase 2 — TLS connection using the externally-generated key.
-    // The host captures raw wire bytes but derives no TLS secrets.
+    //
+    // TRUST NOTE: the host holds esk_client (phase 1) and, after the
+    // handshake, raw_inbound containing epk_server. From these it can compute
+    // shared_secret = X25519(esk_client, epk_server) and thus server_write_key.
+    // A malicious host could forge application-data records. For self-proving
+    // (user runs on their own machine) this is acceptable — the prover is the
+    // user and has no incentive to forge their own data. Delegated proving
+    // requires MPC-TLS or a TEE; see NEXT.md §6.5.
     // -----------------------------------------------------------------------
     let mut provider = make_provider(esk_client);
     provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
@@ -90,7 +97,7 @@ fn main() -> Result<()> {
 
     let response_str = String::from_utf8_lossy(&response_bytes);
     let body = response_str.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-    println!("Response body: {body}");
+    println!("Response: {body}");
 
     eprintln!(
         "phase 2: inbound={} bytes, outbound={} bytes",
@@ -103,11 +110,6 @@ fn main() -> Result<()> {
     // The host provides only esk_client and raw wire bytes.
     // The guest derives all keys and parses all messages independently.
     // -----------------------------------------------------------------------
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
     let witness = TlsWitness {
         esk_client,
         raw_inbound: stream.inbound,
@@ -115,7 +117,6 @@ fn main() -> Result<()> {
         hostname: host.clone(),
         json_field: args.field.clone(),
         threshold: args.threshold,
-        now_unix,
     };
 
     let mut stdin = SP1Stdin::new();

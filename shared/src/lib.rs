@@ -2,14 +2,19 @@ use serde::{Deserialize, Serialize};
 
 /// The full TLS 1.3 witness passed from host → guest via SP1 stdin.
 ///
-/// The host is a dumb relay: it supplies esk_client (generated in phase 1)
-/// and raw wire bytes only. The guest independently derives all keys,
-/// decrypts handshake records, verifies the certificate chain and
-/// CertificateVerify, then decrypts application data.
+/// The host supplies esk_client (generated in phase 1) and the raw wire bytes
+/// captured during the TLS session. The guest independently re-derives all
+/// keys, decrypts handshake records, verifies the certificate chain and
+/// CertificateVerify, and decrypts application data.
+///
+/// Trust boundary: the host holds both esk_client and raw_inbound (which
+/// contains epk_server in the ServerHello). It can therefore derive
+/// shared_secret and server_write_key — meaning a malicious host can forge
+/// application-data records. This is acceptable for self-proving (the user IS
+/// the host). Delegated proving requires MPC-TLS or a TEE; see NEXT.md §6.5.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsWitness {
     /// Client ephemeral X25519 private key (32 bytes), generated in phase 1.
-    /// Never derived by the host from the TLS handshake.
     pub esk_client: [u8; 32],
 
     /// All raw bytes received from the server over TCP.
@@ -25,7 +30,6 @@ pub struct TlsWitness {
     pub hostname: String,
     pub json_field: String,
     pub threshold: f64,
-    pub now_unix: i64,
 }
 
 /// What the guest commits as public output.

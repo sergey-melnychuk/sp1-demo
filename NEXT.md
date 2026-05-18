@@ -34,7 +34,7 @@ Implementing **§2–§5** below moves the repo toward a **production candidate 
 
 Commit as **public outputs** (alongside existing [`PublicClaim`](shared/src/lib.rs)):
 
-- **`now_unix`**: reference wall time agreed with the verifier (currently stored in `TlsWitness.now_unix` but not yet asserted in the guest).
+- **`now_unix`**: reference wall time agreed with the verifier, added as a new `TlsWitness` field and committed by the guest.
 - **`freshness_field`** / **`freshness_window`**: rules such as `server_time ≥ now - window` to bound stale responses.
 
 Example already sketched in [`TODO.md`](TODO.md): Binance-style JSON with `/serverTime` (milliseconds).
@@ -44,7 +44,7 @@ Example already sketched in [`TODO.md`](TODO.md): Binance-style JSON with `/serv
 **CLI / host (`script/src/main.rs`):**
 
 - Add flags: `--freshness-field`, `--freshness-window-past-secs`, `--now` (optional override for testing).
-- `now_unix` is already captured and passed in `TlsWitness`; wire it through to the guest assertion.
+- Add `now_unix: i64` to `TlsWitness` (host captures wall time) and wire it through to the guest assertion.
 
 **Guest (`program/src/main.rs`):**
 

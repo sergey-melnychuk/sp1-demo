@@ -23,8 +23,11 @@ pub fn main() {
     let witness: TlsWitness = sp1_zkvm::io::read();
 
     // -----------------------------------------------------------------------
-    // 1. Parse ClientHello from outbound bytes → extract epk_client_wire.
-    //    Verify epk_client_wire == esk_client * G (closes authorship gap).
+    // 1. Parse ClientHello key_share → epk_client_wire.  RFC 8446 §4.1.2, §4.2.8
+    //    Assert epk_client_wire == esk_client × G.
+    //    The server's CertificateVerify (step 9) signs the transcript that
+    //    includes ClientHello, which includes epk_client.  This assertion
+    //    ties the proof to the specific ephemeral key used in the handshake.
     // -----------------------------------------------------------------------
     let epk_client_wire = parse_client_hello_key_share(&witness.raw_outbound)
         .expect("epk_client not found in ClientHello key_share");
@@ -37,13 +40,26 @@ pub fn main() {
     );
 
     // -----------------------------------------------------------------------
-    // 2. Parse ServerHello from inbound bytes → extract epk_server.
+    // 2. Parse ServerHello key_share → epk_server.  RFC 8446 §4.1.3, §4.2.8
+    //    ServerHello key_share contains a single KeyShareEntry (unlike
+    //    ClientHello which sends a list).  NamedGroup 0x001d = X25519.
     // -----------------------------------------------------------------------
     let epk_server_bytes = parse_server_hello_key_share(&witness.raw_inbound)
         .expect("epk_server not found in ServerHello key_share");
 
     // -----------------------------------------------------------------------
-    // 3. X25519 → HKDF key schedule (RFC 8446 §7.1).
+    // 3. X25519 ECDH + HKDF key schedule.  RFC 8446 §7.1
+    //
+    //    shared_secret = X25519(esk_client, epk_server)
+    //
+    //    early_secret  = HKDF-Extract(0×00·32, 0×00·32)
+    //    derived1      = HKDF-Expand-Label(early_secret, "derived", SHA256(""), 32)
+    //    hs_secret     = HKDF-Extract(derived1, shared_secret)
+    //    server_hs_secret = HKDF-Expand-Label(hs_secret, "s hs traffic", transcript_after_sh, 32)
+    //    derived2      = HKDF-Expand-Label(hs_secret, "derived", SHA256(""), 32)
+    //    master_secret = HKDF-Extract(derived2, 0×00·32)
+    //
+    //    transcript_after_sh = SHA256(ClientHello || ServerHello)
     // -----------------------------------------------------------------------
     let client_secret = StaticSecret::from(witness.esk_client);
     let server_pub = PublicKey::from(epk_server_bytes);
@@ -87,8 +103,21 @@ pub fn main() {
     let (master_secret, _) = Hkdf::<Sha256>::extract(Some(&derived2), &[0u8; 32]);
 
     // -----------------------------------------------------------------------
-    // 4. Decrypt encrypted handshake records in-guest.
-    //    Collect transcript messages; detect Finished; switch to app keys.
+    // 4. Decrypt encrypted handshake records.  RFC 8446 §5.2, §4.4
+    //
+    //    Encrypted records have outer content_type=23 (application_data).
+    //    After AES-128-GCM decryption the last byte is the inner content
+    //    type (22 = handshake).  RFC 8446 §5.2
+    //
+    //    hs_key = HKDF-Expand-Label(server_hs_secret, "key", "", 16)
+    //    hs_iv  = HKDF-Expand-Label(server_hs_secret, "iv",  "", 12)
+    //    nonce  = hs_iv XOR seq  (seq resets to 0 for each key)
+    //
+    //    Expected handshake messages in order:
+    //      8  EncryptedExtensions   RFC 8446 §4.3.1
+    //     11  Certificate           RFC 8446 §4.4.2
+    //     15  CertificateVerify     RFC 8446 §4.4.3
+    //     20  Finished              RFC 8446 §4.4.4
     // -----------------------------------------------------------------------
     let hs_key_vec = expand_label(&server_hs_secret, "key", &[], 16);
     let hs_iv_vec = expand_label(&server_hs_secret, "iv", &[], 12);
@@ -190,7 +219,14 @@ pub fn main() {
     let server_finished_body = server_finished_body.expect("ServerFinished not found");
 
     // -----------------------------------------------------------------------
-    // 5. Compute remaining transcript hashes.
+    // 5. Transcript hashes.  RFC 8446 §4.4 (transcript hash definition)
+    //
+    //    transcript_before_cv       = SHA256(CH || SH || EE || Cert)
+    //    transcript_before_finished = SHA256(CH || SH || EE || Cert || CV)
+    //    transcript_after_finished  = SHA256(CH || SH || EE || Cert || CV || Fin)
+    //
+    //    Each hash covers the 4-byte handshake header (type + 3-byte length)
+    //    plus the message body, exactly as transmitted on the wire.
     // -----------------------------------------------------------------------
     let transcript_before_cv: [u8; 32] = {
         let mut h = Sha256::new();
@@ -217,7 +253,14 @@ pub fn main() {
     };
 
     // -----------------------------------------------------------------------
-    // 6. Verify Server Finished HMAC.
+    // 6. Verify Server Finished HMAC.  RFC 8446 §4.4.4
+    //
+    //    finished_key  = HKDF-Expand-Label(server_hs_secret, "finished", "", 32)
+    //    verify_data   = HMAC-SHA256(finished_key, transcript_before_finished)
+    //
+    //    Proves the server completed the handshake: only a party that derived
+    //    server_hs_secret (i.e. performed X25519 with the real server) can
+    //    produce a valid verify_data.
     // -----------------------------------------------------------------------
     let finished_key = expand_label(&server_hs_secret, "finished", &[], 32);
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&finished_key).unwrap();
@@ -230,7 +273,14 @@ pub fn main() {
     );
 
     // -----------------------------------------------------------------------
-    // 7. Certificate chain verification.
+    // 7. Certificate chain verification.  RFC 8446 §4.4.2, RFC 5280 §6
+    //
+    //    Walk chain[0] (leaf) → chain[n-1], verify each cert's signature
+    //    against the next cert's SPKI (or a trust anchor from webpki-roots).
+    //    Trust anchor matching: subject bytes or last-cert issuer bytes
+    //    compared against Mozilla root store (webpki-roots crate).
+    //    Supported signature algorithms: ECDSA-P256-SHA256, ECDSA-P384-SHA384,
+    //    RSA-PKCS1-SHA256, RSA-PKCS1-SHA384.  RFC 5280 §4.1.1.2
     // -----------------------------------------------------------------------
     let chain: Vec<Certificate> = cert_chain_der
         .iter()
@@ -251,12 +301,31 @@ pub fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // 8. Hostname verification.
+    // 8. Hostname verification via leaf cert SAN.  RFC 9525, RFC 5280 §4.2.1.6
+    //
+    //    Check SubjectAltName extension (OID 2.5.29.17) for a dNSName entry
+    //    matching the requested hostname.  Wildcard: *.example.com matches
+    //    foo.example.com but not foo.bar.example.com (single label only).
+    //    RFC 9525 §6.3 prohibits multi-level wildcard matching.
     // -----------------------------------------------------------------------
     verify_hostname(&chain[0], &witness.hostname);
 
     // -----------------------------------------------------------------------
-    // 9. CertificateVerify.
+    // 9. CertificateVerify.  RFC 8446 §4.4.3, §4.2.3
+    //
+    //    signed_content = 0x20×64 || "TLS 1.3, server CertificateVerify" || 0x00
+    //                     || transcript_before_cv
+    //
+    //    The 64-byte padding and context string prevent cross-protocol attacks.
+    //    Supported signature schemes (RFC 8446 §4.2.3):
+    //      0x0403  ecdsa_secp256r1_sha256  (P-256)
+    //      0x0503  ecdsa_secp384r1_sha384  (P-384)
+    //      0x0804  rsa_pss_rsae_sha256
+    //      0x0805  rsa_pss_rsae_sha384
+    //      0x0401  rsa_pkcs1_sha256
+    //
+    //    This is the key security step: proves the real server (holder of the
+    //    cert private key) signed a transcript that includes epk_client.
     // -----------------------------------------------------------------------
     let cv_msg = &cert_verify_msg;
     assert!(cv_msg.len() >= 4, "CertificateVerify too short");
@@ -320,7 +389,15 @@ pub fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // 10. App traffic key derivation; decrypt application data records.
+    // 10. App traffic key derivation + application record decryption.
+    //     RFC 8446 §7.3 (traffic key calculation), §5.2, §5.3
+    //
+    //     server_app_secret = HKDF-Expand-Label(master_secret, "s ap traffic",
+    //                                           transcript_after_finished, 32)
+    //     app_key = HKDF-Expand-Label(server_app_secret, "key", "", 16)
+    //     app_iv  = HKDF-Expand-Label(server_app_secret, "iv",  "", 12)
+    //     nonce   = app_iv XOR seq_be  (RFC 8446 §5.3)
+    //     aad     = 5-byte TLS record header  (RFC 8446 §5.2)
     // -----------------------------------------------------------------------
     let server_app_secret = expand_label(
         &master_secret,
@@ -375,7 +452,8 @@ pub fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // 11. HTTP response → body → JSON assertion.
+    // 11. HTTP/1.1 response parsing + JSON assertion.
+    //     RFC 9112 §6.1 (chunked transfer encoding), RFC 6901 (JSON Pointer)
     // -----------------------------------------------------------------------
     let response = String::from_utf8(plaintext).expect("response is not UTF-8");
     let raw_body = response.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -418,6 +496,7 @@ struct RawRecord {
     payload: Vec<u8>,
 }
 
+// TLS record header: content_type(1) + legacy_version(2) + length(2).  RFC 8446 §5.1
 fn parse_records(bytes: &[u8]) -> Vec<RawRecord> {
     let mut records = Vec::new();
     let mut pos = 0;
@@ -446,6 +525,7 @@ fn record_to_bytes(r: &RawRecord) -> Vec<u8> {
     out
 }
 
+// Decrypt one TLS 1.3 record; strip inner content type byte.  RFC 8446 §5.2
 fn decrypt_record(
     key: &[u8; 16],
     iv: &[u8; 12],
@@ -488,6 +568,7 @@ struct HandshakeMsg {
     body: Vec<u8>,
 }
 
+// Handshake message: msg_type(1) + length(3) + body.  RFC 8446 §4
 fn parse_handshake_messages(data: &[u8]) -> Result<Vec<HandshakeMsg>, &'static str> {
     let mut msgs = Vec::new();
     let mut pos = 0;
@@ -516,7 +597,9 @@ fn hs_header(msg: &HandshakeMsg) -> [u8; 4] {
     [msg.msg_type, (len >> 16) as u8, (len >> 8) as u8, len as u8]
 }
 
-/// Parse DER certs from a TLS 1.3 Certificate message body.
+/// Certificate message body layout.  RFC 8446 §4.4.2
+/// certificate_request_context(1+N) + certificate_list(3-byte len, then entries)
+/// Each entry: cert_data(3-byte len + DER) + extensions(2-byte len + data)
 fn parse_cert_message(body: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
     let mut pos = 0;
     if pos >= body.len() {
@@ -952,6 +1035,8 @@ fn unchunk(body: &str) -> String {
 // HKDF / crypto helpers
 // ---------------------------------------------------------------------------
 
+// HKDF-Expand-Label.  RFC 8446 §7.1
+// HkdfLabel = length(2) + "tls13 "+label(1+N) + context(1+M)
 fn expand_label(prk: &[u8], label: &str, context: &[u8], len: usize) -> Vec<u8> {
     let full_label = format!("tls13 {label}");
     let mut info = Vec::new();
@@ -970,6 +1055,8 @@ fn empty_hash() -> [u8; 32] {
     Sha256::digest([]).into()
 }
 
+// Per-record nonce: iv XOR seq_be.  RFC 8446 §5.3
+// Sequence number is big-endian in the low 8 bytes; top 4 bytes of iv unchanged.
 fn xor_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
     let mut nonce = *iv;
     for (i, b) in seq.to_be_bytes().iter().enumerate() {

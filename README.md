@@ -29,30 +29,37 @@ The host passes `esk_client` and the raw wire bytes to the SP1 guest. The guest 
 12. Asserts `json[field] > threshold` over the plaintext HTTP response
 13. Commits `{ host, field, threshold, value }` as public outputs
 
-## Trust boundary
+## Threat model
 
 ```
 ┌─────────────────────────────────────────────┐
-│  SP1 GUEST (trusted: proof attests this)    │
+│  SP1 GUEST (proof attests this computation) │
 │                                             │
-│  owns esk_client (never committed publicly) │
-│  derives shared_secret, K, server_write_key │
+│  re-derives shared_secret, server_write_key │
 │  decrypts handshake + application records   │
+│  verifies cert chain + CertificateVerify    │
 │  asserts predicate over plaintext           │
 │  commits: hostname, field, threshold, value │
 └─────────────────────────────────────────────┘
-         ▲ esk_client + raw TCP bytes only
+         ▲ esk_client + raw TCP bytes
 ┌────────┴────────────────────────────────────┐
-│  HOST (untrusted relay)                     │
+│  HOST                                       │
 │                                             │
-│  knows epk_client (public by definition)    │
-│  knows all wire bytes (public TLS record)   │
-│  does NOT derive server_write_key           │
-│  does NOT see plaintext                     │
+│  generates esk_client                       │
+│  knows epk_server (from raw ServerHello)    │
+│  can compute X25519(esk_client, epk_server) │
+│  can therefore derive server_write_key      │
+│  can forge application-data records         │
 └─────────────────────────────────────────────┘
 ```
 
-The host cannot forge server responses: AES-128-GCM authentication requires `server_write_key`, which only the guest derives. The server's `CertificateVerify` signs the full transcript including `epk_client`, so the host cannot substitute a different key or a different server's bytes.
+**What the proof establishes:** given the witness `(esk_client, raw_inbound, raw_outbound)`, the TLS session is cryptographically valid — real cert chain, real `CertificateVerify`, authenticated decryption — and the JSON field exceeds the threshold.
+
+**What the proof does not establish:** that the witness was not constructed by the prover. The host knows `esk_client` and `epk_server`, so it can compute `server_write_key` and encrypt arbitrary application-data records. `CertificateVerify` covers only the handshake transcript; it does not cover application data.
+
+**Self-proving threat model (current scope):** the user runs the prover on their own machine. They made a real request; they have the real data. The proof lets them attest a single field to a third party without sharing the full response. A user has no incentive to forge their own data for their own proof. This is the valid use case for this implementation.
+
+**Out of scope:** delegated proving — where a third party runs the prover on a user's behalf — requires that the prover never holds `server_write_key` in full. That requires splitting the session key across parties, which is a substantially harder problem.
 
 ## Prerequisites
 
@@ -100,7 +107,7 @@ cargo run --release -- \
 Expected output:
 ```
 phase 1: epk_client generated (32 bytes)
-Response body: ...
+Response: ...
 phase 2: inbound=10825 bytes, outbound=480 bytes
 Execution succeeded (no proof generated).
    host:      blockchain.info
@@ -184,4 +191,4 @@ sp1-demo/
 - **Replay:** The proof does not prevent replaying an old valid session. Mitigation: add a timestamp or nonce assertion (see `NEXT.md §2`).
 - **Certificate revocation:** OCSP is not checked — too expensive inside the zkVM.
 - **Tail record omission:** The host could withhold the last N application-data records. Middle-record omission is caught by AES-GCM authentication (wrong nonce → wrong tag). Tail omission requires HTTP response completeness verification (see `NEXT.md §4`).
-- **Delegated proving:** The entity running the prover knows `esk_client` and therefore `server_write_key`. For self-proving (user runs prover on their own machine) this is not a concern. Delegated proving requires MPC-TLS or a TEE.
+- **Self-proving only:** The host knows `esk_client` and can derive `server_write_key`, so a dishonest prover can forge application-data records. The design is sound when the user runs the prover on their own machine; see the threat model above.

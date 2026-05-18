@@ -127,7 +127,7 @@ Guest receives `TlsWitness { esk_client, raw_inbound, raw_outbound, ... }` and:
 │                                                             │
 │  TlsWitness {                                               │
 │    esk_client, raw_inbound, raw_outbound,                   │
-│    hostname, json_field, threshold, now_unix                │
+│    hostname, json_field, threshold                          │
 │  }  →  sp1_zkvm::io::write()                                │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -165,7 +165,6 @@ pub struct TlsWitness {
     pub hostname: String,
     pub json_field: String,
     pub threshold: f64,
-    pub now_unix: i64,
 }
 
 // Committed as public outputs

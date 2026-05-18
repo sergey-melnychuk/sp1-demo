@@ -9,10 +9,9 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// A `SupportedKxGroup` that performs X25519 using a caller-supplied private
 /// key rather than generating one internally.
 ///
-/// This is how `epk_client` (generated in phase 1) is injected into the
-/// TLS handshake without rustls generating its own ephemeral key. The host
-/// legitimately participates in the handshake; it just uses an externally
-/// generated key so the same `esk_client` can be handed to the SP1 guest.
+/// This injects `epk_client` (from phase 1) into the TLS handshake. The host
+/// completes the handshake normally — it knows `esk_client` and can derive
+/// `server_write_key` from the ServerHello. See the trust note in main.rs.
 pub struct ExternalKxGroup {
     /// The ephemeral private key from phase 1.
     pub esk_client: [u8; 32],
