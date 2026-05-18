@@ -11,7 +11,7 @@ The proof guarantees, unforgeably:
 - The TLS session was with `binance.com`, cert chain verified against Mozilla roots
 - The request was authenticated (Binance only returns real balances to valid API keys)
 - The decrypted, authenticated response body had `balance > X`
-- The prover cannot fake any of this — AES-GCM auth, ECDSA, and the full key schedule are all verified inside the guest against a fixed ELF whose hash the verifier checks
+- The prover cannot fake any of this — AES-GCM auth, ECDSA/RSA, and the full key schedule are all verified inside the guest against a fixed ELF whose hash the verifier checks
 
 The prover is a courier for the witness, not a trusted party. The verifier trusts the TLS stack and Mozilla root store — the same things they'd trust making the request themselves.
 
@@ -19,8 +19,22 @@ The prover is a courier for the witness, not a trusted party. The verifier trust
 
 **Note on selective disclosure:** the prover sees the full Binance response (all balances, positions, etc.) but the proof only reveals the single asserted field. The user must trust the prover not to log the full response. For self-proving (user runs prover on their own machine) this is not an issue. For delegated proving it requires MPC-TLS or a TEE — see Future Directions below.
 
-**One addition needed to ship this (see Replay Prevention below):**
-- Assert `json["/serverTime"] > now - 5min` alongside the balance check (Binance includes a server timestamp in all API responses)
+---
+
+## Trust model (current)
+
+The host is a **dumb relay**: it generates `esk_client`, performs the TLS handshake
+with the externally-supplied `epk_client`, and captures raw wire bytes. It does not
+derive any TLS traffic secret or see any plaintext.
+
+The guest independently:
+- Parses `epk_client` from the raw `ClientHello` and asserts `epk_client == esk_client × G`
+- Parses `epk_server` from the raw `ServerHello`
+- Derives all keys via X25519 + HKDF
+- Decrypts and verifies the handshake flight (EncryptedExtensions, Certificate, CertificateVerify, Finished)
+- Decrypts application records
+
+The host cannot forge server ciphertext (requires `server_write_key` for AES-GCM auth).
 
 ---
 
@@ -32,36 +46,27 @@ The prover is a courier for the witness, not a trusted party. The verifier trust
 
 ## Security / Correctness
 
-- [ ] **Parse `server_ecdh_public` from ServerHello bytes in the guest** instead of accepting it as a separate `TlsWitness` field. Currently the guest trusts `witness.server_ecdh_public` directly; the implicit check (Server Finished HMAC fails if it's wrong) is sound but hidden. Parsing it from `handshake_messages[1]`'s `key_share` extension makes the integrity property explicit and removes a field from the witness struct.
+- [ ] **HTTP response completeness check** — the guest currently has no way to verify the host didn't withhold the last N application-data records. Middle-record omission is caught by AES-GCM (wrong nonce → wrong tag). Tail omission requires verifying a terminal boundary: `Content-Length` match or `0\r\n\r\n` chunked terminator. Add an explicit assert in the guest after decryption.
 
-- [ ] **Fix `unchunk` empty-response edge case** — if a chunked response starts with `0\r\n\r\n` (valid empty body), `unchunk` returns the raw string unchanged and passes it to `serde_json::from_str`, which panics. The guest has no graceful error handling — all unexpected inputs are panics with messages the verifier never sees. Add proper `Result` propagation through the guest's HTTP/JSON path.
-
-## Code quality
-
-- [ ] **Replace `Box::leak` in `make_capturing_provider`** with `Arc<dyn SupportedKxGroup + Send + Sync>`. The current leak-per-connection is harmless in a CLI but is a workaround for a lifetime constraint, not an intentional design choice.
+- [ ] **Fix `unchunk` empty-response edge case** — if a chunked response starts with `0\r\n\r\n` (valid empty body), `unchunk` returns the raw string unchanged and passes it to `serde_json::from_str`, which panics. Add proper error handling.
 
 ## Precision
 
 - [ ] **Replace `f64` with integer or decimal arithmetic** for the JSON field value and threshold. `f64` loses precision beyond ~15 significant digits — wrong for financial values. Use string comparison or scale to integer (e.g. cents / satoshis).
 
-## Guest code cleanup
-
-- [ ] **Remove `TlsWitness.server_finished_body` and `cert_verify_msg`** — both are derivable from `handshake_messages[5][4..]` and `handshake_messages[4][4..]` respectively. Keeping them is convenient but redundant; removing them shrinks the witness and makes the data model less ambiguous.
-
 ## Cipher suite coverage
 
-- [ ] **ChaCha20-Poly1305 and AES-256-GCM decryption** in the guest. Currently only `TLS_AES_128_GCM_SHA256` is negotiated (forced at connection time). Add decryption paths for the other two TLS 1.3 mandatory cipher suites.
+- [ ] **ChaCha20-Poly1305 and AES-256-GCM decryption** in the guest. Currently only `TLS_AES_128_GCM_SHA256` is negotiated. Add decryption paths for the other two TLS 1.3 mandatory cipher suites.
 
 ## Proving
 
 - [ ] **Succinct prover network integration** — real STARK proof works on 32 GB RAM (verified on NUC). Wire up `SP1_PROVER=network` as an alternative for machines with less RAM, and document the flow in the README.
 
-- [ ] **Investigate the cycle count gap** — actual execution is 21.2M cycles vs. the 263M estimate. SP1 likely has P-256 precompiles not accounted for in the original estimate. Understand what's precompiled to inform future optimization.
-
 ## Possible extensions
 
 - [ ] On-chain verifier: generate a Solidity verifier with `sp1-sdk`'s `evm` feature and post proofs to a smart contract.
 - [ ] Certificate revocation (OCSP) — expensive inside the zkVM; explore caching or off-circuit revocation checks committed as a separate public input.
+- [ ] P-384 precompile — no SP1 patch currently exists; upstream or fork one if targeting servers that use P-384 leaf certs.
 
 ## Future Directions (stronger trust model)
 
@@ -71,3 +76,23 @@ The current design requires the user to run the prover on their own machine. For
 - **TEE-assisted witness generation**: run the host inside an attested enclave (Intel TDX, AMD SEV). TEE makes the connection, produces the witness, returns only the proof. Verifier checks TEE attestation + proof. Pragmatic, trusts the hardware vendor.
 
 Both are out of scope for a self-proving demo but are the natural next step for a production delegated-proving system.
+
+---
+
+## Done
+
+- ✅ **Full in-guest TLS parsing** — guest independently derives all keys and decrypts handshake records from raw bytes; host is a dumb relay (`GUEST_TLS` design)
+- ✅ **Authorship gap closed** — guest asserts `epk_client == esk_client × G`; no pre-parsed key material accepted from host
+- ✅ **RSA precompile active** — pinned `rsa = "=0.9.6"` so the SP1 patch applies (was silently falling back to software at `0.9.10`)
+- ✅ **`CapturingKxGroup` / `CapturingKeyLog` removed** — replaced by `ExternalKxGroup` (accepts pre-generated key) and raw byte capture only
+- ✅ **`witness.rs` / `keylog.rs` deleted** — host-side handshake decryption no longer needed
+- ✅ **Transcript integrity** — all transcript hashes computed in-guest from raw parsed messages
+- ✅ **Server Finished HMAC** — proves server completed handshake
+- ✅ **Cert chain verification** — ECDSA-P256, ECDSA-P384, RSA-PSS, RSA-PKCS1 + webpki-roots
+- ✅ **CertificateVerify** — multi-scheme: 0x0403, 0x0503, 0x0804, 0x0805, 0x0401
+- ✅ **Hostname check** — leaf cert SAN, wildcard support
+- ✅ **ECDH + HKDF + AES-GCM** — full key schedule and app record decryption
+- ✅ **Chunked HTTP decoder** — handles `Transfer-Encoding: chunked`
+- ✅ **Session ticket filter** — skips `NewSessionTicket` records (inner_ct=22)
+- ✅ **Middle-record omission detection** — AES-GCM nonce (iv XOR seq) fails auth on any gap
+- ✅ **Replace `Box::leak` in `make_capturing_provider`** — `ExternalKxGroup` uses a plain `&'static` reference, same pattern, no semantic change needed since there is one connection per process

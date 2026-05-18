@@ -2,40 +2,30 @@ use serde::{Deserialize, Serialize};
 
 /// The full TLS 1.3 witness passed from host → guest via SP1 stdin.
 ///
-/// The guest uses this to cryptographically verify the entire trust chain:
-///   ECDH shared secret → HKDF key schedule → AES-GCM decryption → HTTP body
-/// and independently verify the server's certificate chain + CertificateVerify
-/// before trusting a single byte of the response.
+/// The host is a dumb relay: it supplies esk_client (generated in phase 1)
+/// and raw wire bytes only. The guest independently derives all keys,
+/// decrypts handshake records, verifies the certificate chain and
+/// CertificateVerify, then decrypts application data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsWitness {
-    /// Client ephemeral X25519 private key (32 bytes).
-    pub client_ecdh_private: [u8; 32],
+    /// Client ephemeral X25519 private key (32 bytes), generated in phase 1.
+    /// Never derived by the host from the TLS handshake.
+    pub esk_client: [u8; 32],
 
-    /// Server ephemeral X25519 public key from ServerHello key_share (32 bytes).
-    pub server_ecdh_public: [u8; 32],
+    /// All raw bytes received from the server over TCP.
+    /// Includes: ServerHello (plaintext), then encrypted handshake records,
+    /// then encrypted application data records.
+    pub raw_inbound: Vec<u8>,
 
-    /// DER-encoded certificate chain: leaf first, then intermediates.
-    pub cert_chain_der: Vec<Vec<u8>>,
+    /// All raw bytes sent to the server over TCP.
+    /// Includes: ClientHello (plaintext), then ClientFinished (encrypted).
+    /// The guest uses this to verify epk_client in the ClientHello transcript.
+    pub raw_outbound: Vec<u8>,
 
-    /// Raw CertificateVerify handshake message body (SignatureScheme + sig).
-    pub cert_verify_msg: Vec<u8>,
-
-    /// Raw handshake message bytes in transcript order, each including the
-    /// 4-byte header (type + 3-byte length):
-    ///   [0] ClientHello
-    ///   [1] ServerHello
-    ///   [2] EncryptedExtensions
-    ///   [3] Certificate
-    ///   [4] CertificateVerify
-    ///   [5] ServerFinished
-    /// The guest computes all transcript hashes from these bytes.
-    pub handshake_messages: Vec<Vec<u8>>,
-
-    /// Encrypted TLS 1.3 application data records (full 5-byte header + ciphertext).
-    pub encrypted_app_records: Vec<Vec<u8>>,
-
-    /// Server Finished handshake message body (HMAC verify data).
-    pub server_finished_body: Vec<u8>,
+    pub hostname: String,
+    pub json_field: String,
+    pub threshold: f64,
+    pub now_unix: i64,
 }
 
 /// What the guest commits as public output.

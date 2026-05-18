@@ -1,16 +1,16 @@
-# zkTLS JSON Assertion — Implementation Plan
+# zkTLS JSON Assertion — Design and Implementation
 
 ## Goal
 
 Generate a ZK proof that says:
 > "A server whose TLS certificate chains to a trusted root CA participated in a handshake
-> that produced a response whose JSON field `/data/amount` is greater than `50000`."
+> that produced a response whose JSON field `/USD/last` is greater than `1000`."
 
-No trusted third party. No oracle. The server's own certificate is the trust anchor.
+No trusted third party. No oracle. No MPC. The server's own certificate is the trust anchor.
 
 ---
 
-## Why This Works (Trust Model)
+## Trust Model
 
 TLS 1.3's **CertificateVerify** message is the key. The server signs the entire handshake
 transcript with its certificate private key. This means:
@@ -20,15 +20,92 @@ transcript with its certificate private key. This means:
 - If the guest derives traffic keys from the handshake → the decrypted plaintext is what the server sent
 - The prover **cannot forge any of this** without the server's private key
 
-The guest does not need network access. It is a pure function over the transcript bytes.
+The guest does not need network access. It is a pure function over `esk_client` + raw wire bytes.
+
+### Trust boundary
+
+```
+┌─────────────────────────────────────────────┐
+│  SP1 GUEST (trusted: proof attests this)    │
+│                                             │
+│  owns esk_client (never committed publicly) │
+│  derives shared_secret, K, server_write_key │
+│  decrypts handshake + application records   │
+│  asserts predicate over plaintext           │
+│  commits: hostname, field, threshold, value │
+└─────────────────────────────────────────────┘
+         ▲ esk_client + raw TCP bytes only
+┌────────┴────────────────────────────────────┐
+│  HOST (untrusted relay)                     │
+│                                             │
+│  knows epk_client (public by definition)    │
+│  knows all wire bytes (public TLS record)   │
+│  does NOT derive server_write_key           │
+│  does NOT see plaintext                     │
+└─────────────────────────────────────────────┘
+```
+
+### Why the host cannot forge
+
+`epk_client` appears inside `ClientHello` key_share. The server's `CertificateVerify`
+signs the full handshake transcript, which covers `ClientHello`. The guest proves
+`epk_client = esk_client × G` matches the transcript. The host cannot substitute a
+different `epk_client` without invalidating `CertificateVerify`. Therefore ciphertext
+encrypted under `server_write_key(K)` where `K = HKDF(esk_client × epk_server)` cannot
+be forged by the host: it does not know `esk_client` in the context of a live session.
+
+### What the proof does NOT cover
+
+- The prover could replay an old valid session (mitigation: timestamp/nonce assertion in JSON — see `NEXT.md §2`)
+- The prover could withhold tail application-data records without detection (mitigation: HTTP response completeness check — see `NEXT.md §4`)
+- The guest trusts hardcoded root CAs — if a CA is compromised, the proof is compromised
+- Certificate revocation is not checked (OCSP inside guest is too expensive)
 
 ---
 
-## What the Proof Does NOT Cover
+## Three-Phase Execution Model
 
-- The prover could replay an old valid session (mitigation: include a timestamp/nonce assertion)
-- The guest trusts hardcoded root CAs — if a CA is compromised, the proof is compromised
-- Certificate revocation is not checked (would require OCSP inside the guest — too expensive)
+### Phase 1 — Key generation (`script/src/keygen.rs`)
+
+Generate a fresh X25519 key pair locally:
+
+```rust
+let esk = StaticSecret::random_from_rng(rand::thread_rng());
+let epk = PublicKey::from(&esk);
+// esk stays in memory; epk is injected into ClientHello
+```
+
+For production, `esk_client` should never touch disk unencrypted; pass in-memory between phases.
+
+### Phase 2 — TLS relay (`script/src/main.rs` + `script/src/capture.rs`)
+
+The host opens a real TLS 1.3 connection using a custom rustls key-exchange hook
+(`ExternalKxGroup`) that accepts `esk_client` externally instead of generating one.
+`CapturingStream` records all raw inbound and outbound TCP bytes.
+
+The host derives **no** TLS traffic secrets. It captures:
+- All raw inbound bytes (ServerHello, encrypted HS records, encrypted app records)
+- All raw outbound bytes (ClientHello, ClientFinished)
+
+### Phase 3 — Prove (`program/src/main.rs`)
+
+Guest receives `TlsWitness { esk_client, raw_inbound, raw_outbound, ... }` and:
+
+1. Parses `ClientHello` from `raw_outbound` → extracts `epk_client_wire`
+2. Asserts `PublicKey::from(&StaticSecret::from(esk_client)) == epk_client_wire`
+3. Parses `ServerHello` from `raw_inbound` → extracts `epk_server`
+4. `shared_secret = X25519(esk_client, epk_server)`
+5. Full HKDF-SHA256 key schedule → `server_hs_secret`, `master_secret`
+6. Decrypts encrypted handshake records in-guest using `server_hs_secret`
+7. Collects `EE`, `Certificate`, `CertificateVerify`, `Finished` messages from decrypted payload
+8. Verifies `Finished` HMAC
+9. Verifies cert chain against `webpki-roots`
+10. Verifies hostname (SAN)
+11. Verifies `CertificateVerify` signature
+12. Derives app traffic key from `master_secret` + full transcript hash
+13. Decrypts application records
+14. Parses HTTP, unchunks, evaluates JSON predicate
+15. Commits `PublicClaim { host, field, threshold, value }`
 
 ---
 
@@ -36,50 +113,42 @@ The guest does not need network access. It is a pure function over the transcrip
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        HOST (script)                        │
+│                    HOST (script crate)                      │
 │                                                             │
-│  TcpStream wrapped in CapturingStream                       │
-│       │ raw bytes captured (both directions)                │
-│  rustls ClientConnection on top                             │
-│       │ actual TLS handshake with api.coinbase.com          │
-│       ▼                                                     │
-│  TlsTranscriptExtractor                                     │
-│   - parses raw captured bytes into TLS 1.3 records          │
-│   - extracts: certs, CertVerify sig, transcript hash,       │
-│     server ECDH pubkey, encrypted app records               │
-│   - reads client ephemeral privkey from rustls KeyLog       │
-│       │                                                     │
-│       ▼                                                     │
-│  TlsWitness { ... }  ←── serialised into guest stdin        │
+│  keygen::generate()                                         │
+│    → (esk_client: [u8;32], epk_client: [u8;32])             │
+│                                                             │
+│  ExternalKxGroup { esk_client }                             │
+│    → rustls uses epk_client in ClientHello key_share        │
+│    → completes X25519 normally (host needs it to finish HS) │
+│                                                             │
+│  CapturingStream                                            │
+│    → records every raw byte in both directions              │
+│                                                             │
+│  TlsWitness {                                               │
+│    esk_client, raw_inbound, raw_outbound,                   │
+│    hostname, json_field, threshold, now_unix                │
+│  }  →  sp1_zkvm::io::write()                                │
 └─────────────────────────────────────────────────────────────┘
-                            │ sp1_zkvm::io::read()
+                            │
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                     GUEST (program)                          │
+│                     GUEST (program crate)                    │
 │                                                              │
-│  1. verify_cert_chain()                                      │
-│     webpki-roots (hardcoded Mozilla roots) + webpki          │
-│                                                              │
-│  2. verify_cert_verify()                                     │
-│     p256::ecdsa — server signed the transcript with its cert │
-│     (or rsa if server uses RSA cert)                         │
-│                                                              │
-│  3. derive_traffic_keys()                                    │
-│     X25519 shared secret → HKDF-SHA256 key schedule          │
-│     → server_write_key + server_write_iv                     │
-│     SHA-256 is precompiled in SP1 → this step is cheap       │
-│                                                              │
-│  4. decrypt_records()                                        │
-│     AES-128-GCM or ChaCha20-Poly1305 over encrypted records  │
-│                                                              │
-│  5. assert_json_field()                                      │
-│     serde_json pointer lookup + numeric comparison           │
-│                                                              │
-│  6. sp1_zkvm::io::commit() public outputs                    │
-│     - server hostname (from cert CN/SAN)                     │
-│     - field pointer                                          │
-│     - threshold                                              │
-│     - actual value                                           │
+│  parse CH key_share → epk_client_wire                        │
+│  assert epk_client_wire == esk_client × G                    │
+│  parse SH key_share → epk_server                             │
+│  X25519(esk_client, epk_server) → shared_secret              │
+│  HKDF → hs_key, hs_iv, master_secret                         │
+│  decrypt HS records → EE, Cert, CertVerify, Finished         │
+│  verify Finished HMAC                                        │
+│  verify cert chain → webpki-roots                            │
+│  verify hostname (SAN)                                       │
+│  verify CertificateVerify (P-256 / P-384 / RSA-PSS / PKCS1)  │
+│  HKDF → app_key, app_iv                                      │
+│  decrypt app records (AES-128-GCM, seq-nonce)                │
+│  unchunk HTTP → serde_json → json[field] > threshold         │
+│  commit(PublicClaim)                                         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -88,487 +157,138 @@ The guest does not need network access. It is a pure function over the transcrip
 ## Data Model
 
 ```rust
-// Passed host → guest via stdin (bincode serialised)
-struct TlsWitness {
-    // Raw handshake message bytes in transcript order:
-    // ClientHello, ServerHello, EncryptedExtensions, Certificate,
-    // CertificateVerify, Finished
-    // Each entry is the full message: [type u8][length u24][body...]
-    // Guest parses these to extract: server_ecdh_pub (from ServerHello),
-    // cert chain DER (from Certificate), sig+scheme (from CertificateVerify),
-    // and computes transcript hashes itself.
-    handshake_messages: Vec<Vec<u8>>,
+// shared/src/lib.rs — passed host → guest via SP1 stdin
+pub struct TlsWitness {
+    pub esk_client: [u8; 32],      // X25519 private scalar (phase 1 output)
+    pub raw_inbound: Vec<u8>,      // all bytes received from server
+    pub raw_outbound: Vec<u8>,     // all bytes sent to server
+    pub hostname: String,
+    pub json_field: String,
+    pub threshold: f64,
+    pub now_unix: i64,
+}
 
-    // Client ephemeral X25519 private key — captured via CapturingKxGroup.
-    // Guest uses this to recompute X25519(client_priv, server_pub) and the
-    // full HKDF key schedule, proving traffic keys came from this handshake.
-    client_ecdh_private: [u8; 32],
-
-    // Negotiated cipher suite (0x1301=TLS_AES_128_GCM_SHA256,
-    // 0x1302=TLS_AES_256_GCM_SHA384, 0x1303=TLS_CHACHA20_POLY1305_SHA256)
-    cipher_suite: u16,
-
-    // Encrypted application data TLS records.
-    // Each entry is (5-byte record header, ciphertext payload).
-    // Guest decrypts these using derived traffic keys.
-    encrypted_app_records: Vec<([u8; 5], Vec<u8>)>,
-
-    // JSON assertion parameters
-    field_pointer: String,
-    threshold: f64,
+// Committed as public outputs
+pub struct PublicClaim {
+    pub host: String,
+    pub field: String,
+    pub threshold: f64,
+    pub value: f64,
 }
 ```
 
 ---
 
-## Ephemeral Key Capture — The Core Problem
-
-### Why KeyLog is not enough
-
-`rustls::KeyLog` (the `SSLKEYLOGFILE` interface) emits derived *traffic secrets*:
+## Key Schedule (TLS 1.3, RFC 8446 §7.1)
 
 ```
-SERVER_HANDSHAKE_TRAFFIC_SECRET <client_random> <secret>
-SERVER_TRAFFIC_SECRET_0         <client_random> <secret>
+shared_secret = X25519(esk_client, epk_server)
+
+early_secret       = HKDF-Extract(salt=0×00·32, ikm=0×00·32)
+derived1           = HKDF-Expand-Label(early_secret, "derived", SHA256(""), 32)
+hs_secret          = HKDF-Extract(salt=derived1, ikm=shared_secret)
+server_hs_secret   = HKDF-Expand-Label(hs_secret, "s hs traffic", transcript_after_sh, 32)
+derived2           = HKDF-Expand-Label(hs_secret, "derived", SHA256(""), 32)
+master_secret      = HKDF-Extract(salt=derived2, ikm=0×00·32)
+server_app_secret  = HKDF-Expand-Label(master_secret, "s ap traffic", transcript_after_fin, 32)
+app_key            = HKDF-Expand-Label(server_app_secret, "key", "", 16)
+app_iv             = HKDF-Expand-Label(server_app_secret, "iv",  "", 12)
 ```
 
-These look useful but are **insufficient for the guest**. If the guest is given
-`SERVER_TRAFFIC_SECRET_0` directly, it can decrypt the records — but a malicious
-prover could supply a fabricated secret paired with fabricated ciphertext. The
-decryption would succeed and the JSON assertion would hold, but no real server
-was ever involved.
-
-The guest must verify the complete trust chain:
-
-```
-client_priv × server_pub  →  shared_secret        [X25519]
-shared_secret + transcript  →  traffic_keys        [HKDF-SHA256]
-traffic_keys + ciphertext   →  plaintext           [AES-GCM]
-server_cert.sign(transcript) = cert_verify_sig     [ECDSA P-256]
-```
-
-Every arrow must be verified in the guest. Giving it `SERVER_TRAFFIC_SECRET_0`
-breaks the chain at the first arrow — X25519 is never checked.
-
-The server's CertificateVerify signature covers the full handshake transcript,
-which includes the ServerHello `key_share` extension containing `server_ecdh_pub`.
-So if the guest verifies CertVerify AND re-derives traffic keys from
-`X25519(client_priv, server_ecdh_pub)`, the entire chain is anchored to the
-server's certificate. Nothing can be forged.
-
-### Why the client ephemeral private key is the right primitive
-
-We need `client_ecdh_private` specifically because:
-- It is the only secret input to the ECDH exchange not visible on the wire
-- `server_ecdh_pub` is in the ServerHello (wire-visible, captured directly)
-- `shared_secret = X25519(client_priv, server_pub)` — guest recomputes this
-- Everything downstream (HKDF, decryption) follows deterministically
-
-### The solution: custom `SupportedKxGroup`
-
-rustls 0.23 generates ephemeral keys internally through the `CryptoProvider`
-abstraction. We replace the built-in X25519 implementation with our own that
-exposes its secrets:
-
-```rust
-// Trait rustls calls to start a key exchange
-pub trait SupportedKxGroup: Send + Sync + Debug {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error>;
-    fn name(&self) -> NamedGroup;
-}
-
-// Trait rustls calls when ServerHello arrives with the server's public key
-pub trait ActiveKeyExchange: Send + Sync {
-    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error>;
-    fn pub_key(&self) -> &[u8];   // our public key — sent in ClientHello
-    fn group(&self) -> NamedGroup;
-}
-```
-
-Our implementation:
-
-```rust
-pub struct CapturingKxGroup {
-    // Written to by complete(); read by the host after handshake
-    pub captured: Arc<Mutex<Option<KeyMaterial>>>,
-}
-
-pub struct KeyMaterial {
-    pub client_private: [u8; 32],
-    pub server_public:  [u8; 32],
-}
-
-impl SupportedKxGroup for CapturingKxGroup {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        let secret  = x25519_dalek::EphemeralSecret::random_from_rng(OsRng);
-        let public  = x25519_dalek::PublicKey::from(&secret);
-        Ok(Box::new(CapturingActiveKx {
-            secret,
-            public,
-            captured: self.captured.clone(),
-        }))
-    }
-    fn name(&self) -> NamedGroup { NamedGroup::X25519 }
-}
-
-impl ActiveKeyExchange for CapturingActiveKx {
-    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
-        let server_pub = <[u8; 32]>::try_from(peer_pub_key).unwrap();
-        // Capture both keys before consuming the secret
-        *self.captured.lock().unwrap() = Some(KeyMaterial {
-            client_private: self.secret.to_bytes(),  // see note below
-            server_public:  server_pub,
-        });
-        let shared = self.secret.diffie_hellman(
-            &x25519_dalek::PublicKey::from(server_pub)
-        );
-        Ok(SharedSecret::from(&shared.to_bytes()[..]))
-    }
-    fn pub_key(&self) -> &[u8] { self.public.as_bytes() }
-    fn group(&self) -> NamedGroup { NamedGroup::X25519 }
-}
-```
-
-**Note on `to_bytes()`:** `x25519_dalek::EphemeralSecret` deliberately does not
-implement `Clone` or expose bytes to discourage key reuse. We must switch to
-`x25519_dalek::StaticSecret` (which is byte-accessible) for this use case, since
-we explicitly need to extract the private key for the ZK witness. This is
-intentional — the security model here is that the prover is the same party who
-holds the private key.
-
-Wire into rustls:
-
-```rust
-let kx_capture = Arc::new(Mutex::new(None));
-let provider = CryptoProvider {
-    kx_groups: vec![Arc::new(CapturingKxGroup { captured: kx_capture.clone() })],
-    ..rustls::crypto::ring::default_provider()
-};
-let config = ClientConfig::builder_with_provider(Arc::new(provider))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
-```
-
-After the handshake, `kx_capture.lock().unwrap()` contains both keys.
+Handshake records decrypted with `server_hs_secret`-derived key/iv.
+Application records decrypted with `app_key` / `app_iv`.
 
 ---
 
-### What the custom KxGroup gives us (and what it does not)
+## AES-GCM Record Decryption
 
-| Data | Source |
-|---|---|
-| `client_ecdh_private` | ✅ CapturingKxGroup |
-| `server_ecdh_public` | ✅ CapturingKxGroup (peer_pub_key in complete()) |
-| `cert_chain` | ✅ rustls `peer_certificates()` |
-| `cipher_suite` | ✅ rustls `negotiated_cipher_suite()` |
-| `client_random` | ⚠️ raw ClientHello bytes |
-| `server_random` | ⚠️ raw ServerHello bytes |
-| `transcript_hash` (for CertVerify) | ⚠️ must compute from raw handshake messages |
-| `handshake_hash` (for app traffic) | ⚠️ must compute from raw handshake messages |
-| `cert_verify_sig` + `scheme` | ⚠️ must decrypt + parse CertificateVerify record |
-| `encrypted_app_records` | ⚠️ raw inbound bytes after handshake |
+```
+nonce    = app_iv XOR seq_num_as_12_byte_be   (seq starts at 0 for each key)
+aad      = 5-byte TLS record header
+plaintext = AES-128-GCM-Decrypt(key=app_key, nonce, aad, ciphertext)
+inner_ct = plaintext[-1]  // strip inner content type byte (RFC 8446 §5.2)
+```
 
-The ⚠️ items require parsing the raw byte stream — see Host Implementation below.
+Middle-record omission is caught automatically: wrong seq → wrong nonce → wrong tag → GCM auth failure.
 
 ---
 
-## Host Implementation
+## SP1 Precompiles
 
-### Step 1 — CapturingStream
-
-Wrap `TcpStream` to record every byte in both directions before rustls sees them:
-
-```rust
-struct CapturingStream {
-    inner:    TcpStream,
-    inbound:  Vec<u8>,   // server → client (TLS records as sent on the wire)
-    outbound: Vec<u8>,   // client → server
-}
-impl Read  for CapturingStream { /* forward + append to inbound  */ }
-impl Write for CapturingStream { /* forward + append to outbound */ }
-```
-
-### Step 2 — KeyLog for handshake decryption (host-side only)
-
-rustls KeyLog emits `SERVER_HANDSHAKE_TRAFFIC_SECRET`. The host uses this to
-decrypt the encrypted handshake records (EncryptedExtensions, Certificate,
-CertificateVerify, Finished) **locally**, so it can extract the raw handshake
-message bytes needed for transcript hashing.
-
-This secret never enters the guest. It is only used by the host to reconstruct
-plaintext handshake messages from the wire bytes.
-
-```rust
-struct HandshakeSecretLog {
-    server_hs_secret: Arc<Mutex<Option<Vec<u8>>>>,
-}
-impl KeyLog for HandshakeSecretLog {
-    fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
-        if label == "SERVER_HANDSHAKE_TRAFFIC_SECRET" {
-            *self.server_hs_secret.lock().unwrap() = Some(secret.to_vec());
-        }
-    }
-}
-```
-
-### Step 3 — TLS record parsing
-
-Parse the captured `inbound` bytes into TLS records:
-
-```
-TLS record:  [content_type u8][version u16][length u16][payload: length bytes]
-  content types:  0x14=ChangeCipherSpec  0x15=Alert  0x16=Handshake  0x17=AppData
-
-TLS 1.3 handshake messages (inside record payload):
-  [msg_type u8][length u24][body: length bytes]
-  msg_type:  0x01=ClientHello  0x02=ServerHello  0x08=EncryptedExtensions
-             0x0B=Certificate  0x0F=CertificateVerify  0x14=Finished
-```
-
-**Unencrypted records** (before server Finished):
-- ClientHello (content_type=0x16) — extract `client_random` at offset 6
-- ServerHello (content_type=0x16) — extract `server_random` at offset 6,
-  parse extensions to find `key_share` (type 0x0033) → `server_ecdh_pub`
-
-**Encrypted handshake records** (content_type=0x17, after ServerHello):
-- Decrypt with host-side HKDF from `SERVER_HANDSHAKE_TRAFFIC_SECRET`
-- Strip the 1-byte inner content type suffix
-- Parse inner handshake messages: EncryptedExtensions, Certificate,
-  CertificateVerify, Finished
-
-**Application data records** (content_type=0x17, after server Finished):
-- Collected as raw `(header_bytes, payload_bytes)` pairs
-- These are passed to the guest for decryption
-
-### Step 4 — Compute transcript hashes (on host, verified by guest)
-
-The TLS 1.3 transcript hash is SHA-256 over concatenated **handshake message bytes**
-(the 4-byte header + body, NOT TLS record framing).
-
-```
-transcript_hash_for_cert_verify =
-    SHA256( CH_msg || SH_msg || EE_msg || Cert_msg )
-
-handshake_hash =
-    SHA256( CH_msg || SH_msg || EE_msg || Cert_msg || CV_msg || Fin_msg )
-```
-
-The guest recomputes these independently from the raw messages in `TlsWitness`
-and checks they match what CertificateVerify was signed over.
-
-### Step 5 — Assemble TlsWitness and write to stdin
-
-```rust
-let witness = TlsWitness {
-    handshake_messages,       // Vec<Vec<u8>> — raw msg bytes in order
-    client_ecdh_private,      // from CapturingKxGroup
-    cipher_suite,             // from rustls negotiated_cipher_suite()
-    encrypted_app_records,    // Vec<(header: [u8;5], payload: Vec<u8>)>
-    field_pointer,
-    threshold,
-};
-stdin.write(&witness);
-```
-
-The `cert_chain` and `server_ecdh_pub` are NOT passed separately — the guest
-parses them directly from `handshake_messages` (Certificate and ServerHello
-messages respectively). This ensures the guest verifies what's actually in the
-transcript, not a pre-parsed copy the host could lie about.
-
----
-
-## Guest Implementation
-
-### Crates (all no_std compatible)
-
-| Crate | Purpose | no_std |
+| Primitive | Crate | Status |
 |---|---|---|
-| `p256` | ECDSA P-256 cert verify sig | ✅ |
-| `rsa` | RSA cert verify sig (fallback) | ✅ |
-| `x25519-dalek` | ECDH shared secret | ✅ |
-| `sha2` | SHA-256 (SP1 precompiled) | ✅ |
-| `hmac` + `hkdf` | TLS 1.3 key schedule | ✅ |
-| `aes-gcm` | Decrypt app records | ✅ |
-| `chacha20poly1305` | Decrypt app records (alt) | ✅ |
-| `webpki` | Certificate chain validation | ✅ |
-| `webpki-roots` | Mozilla root CAs (hardcoded) | ✅ |
-| `x509-parser` | Parse DER cert fields | ✅ |
-| `serde_json` | JSON pointer assertion | ✅ (alloc) |
+| X25519 ECDH | `x25519-dalek` | ✅ curve25519 precompile |
+| SHA-256 | `sha2` | ✅ SHA256 precompile |
+| P-256 ECDSA | `p256` | ✅ patched elliptic-curves |
+| BigInt (RSA) | `crypto-bigint` | ✅ patched |
+| RSA verify | `rsa` | ✅ pinned `=0.9.6`, patched |
+| AES-128-GCM | `aes-gcm` | ❌ software |
+| P-384 ECDSA | `p384` | ❌ software (no SP1 patch) |
 
-### Key derivation (TLS 1.3 schedule)
-
-```
-shared_secret = X25519(client_priv, server_pub)
-
-early_secret          = HKDF-Extract(salt=0x00*32, ikm=0x00*32)
-derived_secret        = HKDF-Expand-Label(early_secret, "derived", SHA256(""), 32)
-handshake_secret      = HKDF-Extract(salt=derived_secret, ikm=shared_secret)
-server_hs_traffic     = HKDF-Expand-Label(handshake_secret, "s hs traffic", transcript_hash, 32)
-derived_secret2       = HKDF-Expand-Label(handshake_secret, "derived", SHA256(""), 32)
-master_secret         = HKDF-Extract(salt=derived_secret2, ikm=0x00*32)
-server_app_traffic    = HKDF-Expand-Label(master_secret, "s ap traffic", handshake_hash, 32)
-server_write_key      = HKDF-Expand-Label(server_app_traffic, "key", "", 16)  // AES-128
-server_write_iv       = HKDF-Expand-Label(server_app_traffic, "iv",  "", 12)
-```
-
-### AES-GCM record decryption
-
-```
-nonce = server_write_iv XOR (record_sequence_number as 12-byte big-endian)
-plaintext = AES-128-GCM-Decrypt(key=server_write_key, nonce, aad=tls_record_header, ciphertext)
-// last byte of plaintext is inner content type — strip it
-```
-
-### CertificateVerify message
-
-The server signs:
-```
-msg = 0x20 * 64          // 64 space bytes
-   || "TLS 1.3, server CertificateVerify\0"
-   || transcript_hash    // SHA256 of handshake up to Certificate message
-```
-Guest verifies with the leaf cert's public key.
+RSA must be pinned to `=0.9.6` in `program/Cargo.toml`; the workspace patch targets that version. Resolving `0.9.10` (the crates.io default) silently skips the patch.
 
 ---
 
-## Cycle Cost Estimate
-
-| Step | Precompile | ~Cycles |
-|---|---|---|
-| Cert chain verify (webpki) | ❌ | ~50M |
-| P-256 ECDSA (CertVerify) | ❌ | ~100M |
-| X25519 ECDH | ❌ | ~30M |
-| HKDF-SHA256 key schedule | ✅ SHA-256 | ~2M |
-| AES-128-GCM (1KB payload) | ❌ | ~80M |
-| JSON parse + assert | ✅ | ~1M |
-| **Total** | | **~263M** |
-
-At ~2M cycles/s proving on CPU → ~2 min. GPU would be ~10–15s.
-
----
-
-## Directory Structure After Implementation
+## Directory Structure
 
 ```
 sp1-demo/
-├── program/
-│   └── src/main.rs          ← guest: verify TLS transcript + assert JSON
-├── script/
-│   └── src/
-│       ├── main.rs          ← CLI entry point
-│       ├── capture.rs       ← CapturingStream + TLS record parser
-│       ├── witness.rs       ← TlsWitness struct + builder
-│       └── keylog.rs        ← KeyLog impl to capture ephemeral keys
-└── shared/                  ← new crate
-    └── src/lib.rs           ← TlsWitness struct (shared between host and guest)
+├── program/src/main.rs     guest: TLS parsing, key schedule, verification, JSON assert
+├── script/src/
+│   ├── main.rs             CLI: three-phase orchestration
+│   ├── capture.rs          ExternalKxGroup + CapturingStream
+│   └── keygen.rs           Phase 1: X25519 key pair generation
+└── shared/src/lib.rs       TlsWitness + PublicClaim
 ```
 
----
-
-## Implementation Order
-
-1. `shared/` crate — `TlsWitness` struct with serde derives
-2. `script/src/capture.rs` — `CapturingStream`
-3. `script/src/keylog.rs` — `KeyLog` impl  
-4. `script/src/witness.rs` — TLS record parser → `TlsWitness`
-5. `script/src/main.rs` — wire it all together
-6. `program/src/main.rs` — guest verification logic, one step at a time:
-   a. cert chain
-   b. CertificateVerify
-   c. key derivation
-   d. decryption
-   e. JSON assertion
+Deleted (no longer needed):
+- `script/src/keylog.rs` — host-side HS decryption; guest now decrypts independently
+- `script/src/witness.rs` — host-side record parser; guest now parses from raw bytes
 
 ---
 
-## Current Status (2026-05-14)
+## Implementation Status (2026-05-18)
 
 ### ✅ Fully Working End-to-End
 
-The pipeline passes for `https://blockchain.info/ticker` with field `/USD/last` threshold `1000`.  
-Execution: **~21.2M cycles** (much lower than the earlier estimate of 263M).
+The pipeline passes for `https://blockchain.info/ticker` with field `/USD/last` threshold `1000`.
 
 ```
-cargo run --release --bin sp1-https-json-script -- \
-  --url https://blockchain.info/ticker \
-  --field /USD/last --threshold 1000
+SP1_SKIP_PROGRAM_BUILD=1 cargo run --release --package sp1-https-json-script -- \
+  --url https://blockchain.info/ticker --field /USD/last --threshold 1000
 ```
 
-All components implemented and `cargo clippy` is clean.
+**~20.9M cycles** (execute mode, all precompiles active).
 
 | Component | File | Notes |
 |---|---|---|
-| `CapturingKxGroup` | `script/src/capture.rs` | Captures client X25519 private key + server public key |
-| `CapturingStream` | `script/src/capture.rs` | Captures all raw TLS wire bytes |
-| `CapturingKeyLog` | `script/src/keylog.rs` | Captures `SERVER_HANDSHAKE_TRAFFIC_SECRET` for host-side HS decryption |
-| TLS record parser | `script/src/witness.rs` | Parses records, decrypts encrypted handshake, assembles `TlsWitness` |
-| `shared/TlsWitness` | `shared/src/lib.rs` | Serde-serialisable witness struct shared between host and guest |
-| Host TLS connection | `script/src/main.rs` | Real TLS connection using all capturing infrastructure |
-| Transcript integrity | `program/src/main.rs` | All four transcript hashes computed in-guest |
+| Key generation | `script/src/keygen.rs` | X25519 key pair, phase 1 |
+| `ExternalKxGroup` | `script/src/capture.rs` | Injects pre-generated `esk_client` into rustls |
+| `CapturingStream` | `script/src/capture.rs` | Records raw inbound + outbound bytes |
+| Three-phase orchestration | `script/src/main.rs` | keygen → relay → witness → SP1 |
+| `TlsWitness` | `shared/src/lib.rs` | `esk_client` + raw bytes only |
+| Authorship assertion | `program/src/main.rs` | `epk_client_wire == esk_client × G` |
+| CH/SH key_share parsing | `program/src/main.rs` | Extracts epk_client and epk_server from raw records |
+| In-guest HS decryption | `program/src/main.rs` | Decrypts EE/Cert/CertVerify/Finished |
+| Transcript integrity | `program/src/main.rs` | Four transcript hashes computed in-guest |
 | Server Finished HMAC | `program/src/main.rs` | Proves server completed handshake |
 | Cert chain verification | `program/src/main.rs` | ECDSA-P256, ECDSA-P384, RSA-PSS, RSA-PKCS1 + webpki-roots |
-| CertificateVerify | `program/src/main.rs` | Multi-scheme: 0x0403, 0x0503, 0x0804, 0x0805, 0x0401 |
+| CertificateVerify | `program/src/main.rs` | Schemes: 0x0403, 0x0503, 0x0804, 0x0805, 0x0401 |
 | Hostname check | `program/src/main.rs` | Leaf cert SAN, wildcard support |
-| ECDH + HKDF + AES-GCM | `program/src/main.rs` | Full key schedule and app record decryption |
-| Chunked HTTP decoder | `program/src/main.rs` | `unchunk()` — handles Transfer-Encoding: chunked |
-| Session ticket filter | `program/src/main.rs` | Skips NewSessionTicket records (inner_ct=22) |
+| App traffic key derivation | `program/src/main.rs` | HKDF from master_secret + full transcript hash |
+| AES-128-GCM decryption | `program/src/main.rs` | Per-record seq-nonce; GCM enforces middle-omission detection |
+| Chunked HTTP decoder | `program/src/main.rs` | Handles `Transfer-Encoding: chunked` |
+| Session ticket filter | `program/src/main.rs` | Skips NewSessionTicket (inner_ct=22) |
+| JSON predicate | `program/src/main.rs` | RFC 6901 pointer + `f64` comparison |
+| Public claim commit | `program/src/main.rs` | `{ host, field, threshold, value }` |
 
-### Guest verification flow (complete)
+### Known open items
 
-```
-witness.handshake_messages
-  → compute transcript hashes at each checkpoint              [SHA-256, in-guest]
-  → verify Server Finished HMAC                               [HMAC-SHA256]
-  → verify cert chain signatures                              [ECDSA-P256/P384/RSA]
-  → verify against webpki-roots trust anchors                 [DER byte comparison]
-      Strategy A: cert subject matches anchor
-      Strategy B: last cert issuer matches anchor (cross-signed roots)
-  → verify leaf cert SAN contains `host`                      [DER parsing]
-  → verify CertificateVerify signature (leaf cert private key) [multi-scheme]
-  → X25519(client_priv, server_pub) + HKDF → app traffic key [X25519 + HKDF-SHA256]
-  → AES-128-GCM decrypt app records, filter session tickets   [AES-GCM]
-  → unchunk HTTP body → JSON pointer → numeric assertion
-  → commit(host, field, threshold, value)
-```
+See `NEXT.md` for detailed notes. Short list:
 
-### Implementation notes
-
-- **webpki-roots 0.26 format:** `TrustAnchor::subject` and `subject_public_key_info` store
-  the *inner content* of their DER SEQUENCE — without the outer `0x30` wrapper. Trust anchor
-  matching uses raw DER byte comparison after stripping wrappers from the chain's DER. The
-  `parse_anchor_spki()` helper re-wraps the content into a full SEQUENCE before calling
-  `SubjectPublicKeyInfoOwned::from_der`.
-
-- **Cross-signed certificate chains:** Some servers (e.g. blockchain.info) include a root cert
-  in the chain whose SUBJECT is in the trust store (DigiCert Global Root G2) but whose ISSUER
-  points to an older root not in webpki-roots. `find_trust_anchor` uses two strategies:
-  (A) find any cert whose subject matches a trust anchor, (B) check if the last cert's issuer
-  matches a trust anchor (for chains that don't include the root at all).
-
-- **TLS NewSessionTicket records:** After the handshake the server sends NewSessionTicket
-  as encrypted ApplicationData records with inner content type 22 (Handshake), not 23.
-  These are filtered before appending to the HTTP plaintext.
-
-### Known limitations / follow-ups
-
-- **Real STARK proof requires 32–64 GB RAM.** Running `--prove` on a laptop is OOM-killed.
-  Use `SP1_PROVER=mock` for development or submit to the Succinct prover network.
-- **Certificate revocation not checked.** OCSP inside zkVM is prohibitively expensive.
-- **Replay not prevented.** A prover could reuse an old valid session transcript. Mitigation:
-  assert on a timestamp or nonce field in the JSON response (e.g. `/timestamp`).
-- **Single cipher suite.** Only `TLS_AES_128_GCM_SHA256` is negotiated. ChaCha20-Poly1305
-  and AES-256-GCM would need additional decryption paths in the guest.
-- **No ChaCha20-Poly1305 / AES-256 support.** The script forces AES-128-GCM but if the
-  server rejects it the connection will fail.
-
-### Potential next steps
-
-1. **Succinct network integration** — submit proof job via `SP1_PROVER=network` to avoid
-   local RAM requirements.
-2. **Timestamp / replay prevention** — add `--nonce-field` CLI arg; guest asserts the JSON
-   field equals a fresh nonce or is within an acceptable time window.
-3. **On-chain verifier** — generate a Solidity verifier with `sp1-sdk`'s `evm` feature and
-   post proofs to a smart contract.
-4. **Broader URL support** — test against more endpoints; handle servers that don't support
-   TLS 1.3-only or require SNI fallback.
+- Replay prevention (`--freshness-field`)
+- HTTP tail-record completeness check
+- `f64` → integer arithmetic for financial values
+- ChaCha20-Poly1305 / AES-256-GCM decryption paths
+- Stricter PKIX (validity window, EKU, basic constraints)
+- Succinct prover network integration

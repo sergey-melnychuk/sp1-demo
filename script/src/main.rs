@@ -1,9 +1,8 @@
 mod capture;
-mod keylog;
-mod witness;
+mod keygen;
 
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -13,10 +12,8 @@ use sp1_sdk::{
     include_elf, ProvingKey, SP1ProofWithPublicValues,
 };
 
-use capture::{make_capturing_provider, CapturingStream, KeyMaterial};
-use keylog::CapturingKeyLog;
-use sp1_https_json_shared::PublicClaim;
-use witness::assemble_witness;
+use capture::{make_provider, CapturingStream};
+use sp1_https_json_shared::{PublicClaim, TlsWitness};
 
 const ELF: Elf = include_elf!("sp1-https-json-program");
 
@@ -42,29 +39,27 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Parse host + port from URL.
     let url = url::Url::parse(&args.url).context("invalid URL")?;
     let host = url.host_str().context("URL has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(443);
-    let path = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
+    let path = if url.path().is_empty() { "/" } else { url.path() };
     let query_path = match url.query() {
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
     };
 
     // -----------------------------------------------------------------------
-    // 1. Set up capturing infrastructure.
+    // Phase 1 — Key generation.
+    // esk_client stays in memory; epk_client is injected into ClientHello.
     // -----------------------------------------------------------------------
+    let (esk_client, epk_client) = keygen::generate();
+    eprintln!("phase 1: epk_client generated ({} bytes)", epk_client.len());
 
-    let kx_captured: Arc<Mutex<Option<KeyMaterial>>> = Arc::new(Mutex::new(None));
-    let (keylog, secrets_arc) = CapturingKeyLog::new();
-
-    // Force AES-128-GCM-SHA256 so the witness parser knows the exact cipher.
-    let mut provider = make_capturing_provider(kx_captured.clone());
+    // -----------------------------------------------------------------------
+    // Phase 2 — TLS connection using the externally-generated key.
+    // The host captures raw wire bytes but derives no TLS secrets.
+    // -----------------------------------------------------------------------
+    let mut provider = make_provider(esk_client);
     provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
 
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -73,16 +68,6 @@ fn main() -> Result<()> {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         })
         .with_no_client_auth();
-
-    let config = {
-        let mut c = config;
-        c.key_log = Arc::new(keylog);
-        c
-    };
-
-    // -----------------------------------------------------------------------
-    // 2. Connect and do the HTTP GET, capturing everything.
-    // -----------------------------------------------------------------------
 
     let server_name: rustls::pki_types::ServerName =
         host.clone().try_into().context("invalid server name")?;
@@ -93,79 +78,48 @@ fn main() -> Result<()> {
     let mut tls = rustls::ClientConnection::new(Arc::new(config), server_name)?;
     let mut joined = rustls::Stream::new(&mut tls, &mut stream);
 
-    // Write HTTP/1.1 GET request.
     use std::io::Write;
     write!(
         joined,
         "GET {query_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
     )?;
 
-    // Read full response.
     use std::io::Read;
     let mut response_bytes = Vec::new();
     joined.read_to_end(&mut response_bytes)?;
 
     let response_str = String::from_utf8_lossy(&response_bytes);
-
-    // Extract HTTP body (after \r\n\r\n).
-    let body = response_str
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
-
+    let body = response_str.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
     println!("Response body: {body}");
 
-    // -----------------------------------------------------------------------
-    // 3. Assemble the TLS witness.
-    // -----------------------------------------------------------------------
-
-    let km = kx_captured
-        .lock()
-        .unwrap()
-        .take()
-        .context("KeyMaterial not captured — handshake did not complete?")?;
-
-    let secrets = secrets_arc.lock().unwrap().clone();
-    let hs_secret = secrets
-        .server_hs_traffic_secret
-        .context("SERVER_HANDSHAKE_TRAFFIC_SECRET not captured")?;
-
     eprintln!(
-        "debug: inbound={} bytes, outbound={} bytes, hs_secret={} bytes",
+        "phase 2: inbound={} bytes, outbound={} bytes",
         stream.inbound.len(),
         stream.outbound.len(),
-        hs_secret.len()
-    );
-
-    let tls_witness = assemble_witness(
-        &stream.inbound,
-        &stream.outbound,
-        km.client_private,
-        km.server_public,
-        &hs_secret,
-    )?;
-
-    println!(
-        "TLS witness assembled: {} certs, {} app records, cv_msg {} bytes",
-        tls_witness.cert_chain_der.len(),
-        tls_witness.encrypted_app_records.len(),
-        tls_witness.cert_verify_msg.len(),
     );
 
     // -----------------------------------------------------------------------
-    // 4. Write inputs to the guest stdin.
+    // Phase 3 — Assemble witness and run SP1 guest.
+    // The host provides only esk_client and raw wire bytes.
+    // The guest derives all keys and parses all messages independently.
     // -----------------------------------------------------------------------
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let witness = TlsWitness {
+        esk_client,
+        raw_inbound: stream.inbound,
+        raw_outbound: stream.outbound,
+        hostname: host.clone(),
+        json_field: args.field.clone(),
+        threshold: args.threshold,
+        now_unix,
+    };
 
     let mut stdin = SP1Stdin::new();
-    stdin.write(&tls_witness); // full TLS witness for in-guest verification
-    stdin.write(&host); // hostname (committed as public output)
-    stdin.write(&args.field);
-    stdin.write(&args.threshold);
-
-    // -----------------------------------------------------------------------
-    // 5. Execute or prove.
-    // -----------------------------------------------------------------------
+    stdin.write(&witness);
 
     let prover = ProverClient::from_env();
 
