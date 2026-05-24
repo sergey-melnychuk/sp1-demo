@@ -9,6 +9,10 @@ edition = "2024"
 name = "notary"
 path = "src/lib.rs"
 
+[[bin]]
+name = "gen_sha256_compress"
+path = "src/bin/gen_sha256_compress.rs"
+
 [dependencies]
 fancy-garbling          = { git = "https://github.com/GaloisInc/swanky", package = "fancy-garbling" }
 swanky-twopac           = { git = "https://github.com/GaloisInc/swanky", package = "swanky-twopac" }
@@ -17,7 +21,7 @@ swanky-rng              = { git = "https://github.com/GaloisInc/swanky", package
 swanky-error            = { git = "https://github.com/GaloisInc/swanky", package = "swanky-error" }
 swanky-ot-chou-orlandi  = { git = "https://github.com/GaloisInc/swanky", package = "swanky-ot-chou-orlandi" }
 aes-gcm = "0.10"
-sha2    = "0.10"
+sha2    = { version = "0.10", features = ["compress"] }
 hmac    = "0.12"
 
 # Notary binary deps (TLS proxy + IPC)
@@ -25,6 +29,7 @@ rustls       = { version = "0.23", features = ["ring"] }
 webpki-roots = "0.26"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+curve25519-dalek = { version = "4", features = ["group", "zeroize"] }
 rand         = "0.8"
 serde        = { version = "1", features = ["derive"] }
 bincode      = "1.3"
