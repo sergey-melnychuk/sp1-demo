@@ -200,33 +200,39 @@ fn read_header(ch: &mut Channel) -> SwankyResult<Header> {
 /// Drive the notary side of 2PC AES-GCM for as long as the channel produces
 /// frame headers. Exits cleanly on connection close (Err on `read_header`).
 ///
-/// `k_n` is the notary's share of the TLS write key for this connection;
-/// `base_iv` is the TLS 1.3 static IV — the per-record nonce is `base_iv XOR seq`.
+/// `k_n_tx`/`iv_tx` are used when the prover requests an encrypt (its outbound
+/// records); `k_n_rx`/`iv_rx` are used for decrypt (its inbound records).
+/// TLS 1.3 uses separate keys per direction (RFC 8446 §7.3).
+///
+/// For tests where direction doesn't matter, pass the same key for both.
 pub fn run_notary_worker(
     channel: &mut Channel,
-    k_n: [u8; 16],
-    base_iv: [u8; 12],
+    k_n_tx: [u8; 16],
+    iv_tx: [u8; 12],
+    k_n_rx: [u8; 16],
+    iv_rx: [u8; 12],
 ) -> SwankyResult<()> {
     loop {
         let header = match read_header(channel) {
             Ok(h) => h,
             Err(_) => return Ok(()), // peer closed
         };
-        let nonce = tls13_nonce(&base_iv, header.seq);
         match header.op {
             OP_ENCRYPT => {
+                let nonce = tls13_nonce(&iv_tx, header.seq);
                 notary_encrypt_gcm(
                     channel,
-                    k_n,
+                    k_n_tx,
                     nonce,
                     &header.aad,
                     header.payload_len as usize,
                 )?;
             }
             OP_DECRYPT => {
+                let nonce = tls13_nonce(&iv_rx, header.seq);
                 notary_decrypt_gcm(
                     channel,
-                    k_n,
+                    k_n_rx,
                     nonce,
                     header.aad.len(),
                     header.payload_len as usize,
@@ -270,7 +276,18 @@ pub struct ClientWorker {
 impl ClientWorker {
     /// Spawn the worker thread. Takes ownership of a `Read + Write + Send`
     /// stream to the notary (typically `TcpStream`).
-    pub fn spawn<S>(stream: S, k_c: [u8; 16], base_iv: [u8; 12]) -> Self
+    ///
+    /// `k_c_tx`/`iv_tx` are used for outbound (encrypt) records;
+    /// `k_c_rx`/`iv_rx` for inbound (decrypt). TLS 1.3 derives separate
+    /// keys per direction (RFC 8446 §7.3) — for unit tests where direction
+    /// doesn't matter, pass the same key twice.
+    pub fn spawn<S>(
+        stream: S,
+        k_c_tx: [u8; 16],
+        iv_tx: [u8; 12],
+        k_c_rx: [u8; 16],
+        iv_rx: [u8; 12],
+    ) -> Self
     where
         S: Read + Write + Send + 'static,
     {
@@ -281,7 +298,7 @@ impl ClientWorker {
                     match job {
                         ClientJob::Encrypt { plaintext, aad, seq, respond } => {
                             let result =
-                                encrypt_one(ch, k_c, base_iv, &plaintext, &aad, seq);
+                                encrypt_one(ch, k_c_tx, iv_tx, &plaintext, &aad, seq);
                             let _ = respond.send(result.map_err(|e| format!("{e:?}")));
                         }
                         ClientJob::Decrypt {
@@ -292,7 +309,7 @@ impl ClientWorker {
                             respond,
                         } => {
                             let result =
-                                decrypt_one(ch, k_c, base_iv, &ciphertext, tag, &aad, seq);
+                                decrypt_one(ch, k_c_rx, iv_rx, &ciphertext, tag, &aad, seq);
                             let _ = respond.send(result.map_err(|e| format!("{e:?}")));
                         }
                         ClientJob::Shutdown => return Ok(()),
@@ -326,6 +343,33 @@ impl ClientWorker {
             Ok(())
         }
     }
+}
+
+/// Encrypt one TLS record over a swanky channel paired with [`run_notary_worker`]
+/// on the other side. Writes the bridge header (op=encrypt + seq + aad +
+/// payload_len), then runs the 2PC encrypt.
+pub fn client_encrypt_record(
+    ch: &mut Channel,
+    k_c: [u8; 16],
+    base_iv: [u8; 12],
+    plaintext: &[u8],
+    aad: &[u8],
+    seq: u64,
+) -> SwankyResult<(Vec<u8>, [u8; 16])> {
+    encrypt_one(ch, k_c, base_iv, plaintext, aad, seq)
+}
+
+/// Decrypt one TLS record over a swanky channel paired with [`run_notary_worker`].
+pub fn client_decrypt_record(
+    ch: &mut Channel,
+    k_c: [u8; 16],
+    base_iv: [u8; 12],
+    ciphertext: &[u8],
+    tag: [u8; 16],
+    aad: &[u8],
+    seq: u64,
+) -> SwankyResult<Vec<u8>> {
+    decrypt_one(ch, k_c, base_iv, ciphertext, tag, aad, seq)
 }
 
 fn encrypt_one(
@@ -545,12 +589,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let notary_handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let _ = Channel::with(stream, |ch| run_notary_worker(ch, k_n, base_iv));
+            let _ =
+                Channel::with(stream, |ch| run_notary_worker(ch, k_n, base_iv, k_n, base_iv));
         });
 
         let stream = TcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
-        let worker = ClientWorker::spawn(stream, k_c, base_iv);
+        let worker = ClientWorker::spawn(stream, k_c, base_iv, k_c, base_iv);
 
         let mut encrypter = worker.make_encrypter();
         let mut decrypter = worker.make_decrypter();
