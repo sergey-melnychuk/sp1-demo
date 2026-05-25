@@ -26,7 +26,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use notary::tls::{client_decrypt_record, client_encrypt_record, tls13_aad};
+use notary::tls::{
+    client_decrypt_record, client_encrypt_record, client_finish_session, tls13_aad,
+};
 use rand::RngCore;
 use rustls::crypto::cipher::AeadKey;
 use rustls::{ClientConfig, ClientConnection};
@@ -43,6 +45,22 @@ struct Args {
     /// Notary proxy address.
     #[arg(long, default_value = "127.0.0.1:9001")]
     notary: String,
+
+    /// Optional: bincode-serialize the resulting `TlsWitness` to this path
+    /// (raw inbound/outbound + signed bundle + K_C shares + claim params).
+    /// Consumed by `sp1-demo-host`'s `notarized` binary to drive the SP1 guest.
+    #[arg(long)]
+    witness_out: Option<std::path::PathBuf>,
+
+    /// JSON Pointer to the field to claim (e.g. `/userId`).
+    /// Only used when `--witness-out` is set.
+    #[arg(long, default_value = "/userId")]
+    field: String,
+
+    /// Threshold for the field-value claim (`field > threshold`).
+    /// Only used when `--witness-out` is set.
+    #[arg(long, default_value_t = 0.0)]
+    threshold: f64,
 }
 
 fn xor_key(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
@@ -50,8 +68,8 @@ fn xor_key(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
 }
 
 /// Read one TLS record from a stream: 5-byte header + payload.
-/// Returns (content_type, legacy_version, payload).
-fn read_tls_record(s: &mut TcpStream) -> Result<(u8, u16, Vec<u8>)> {
+/// Returns (content_type, legacy_version, payload, raw_record_bytes).
+fn read_tls_record(s: &mut TcpStream) -> Result<(u8, u16, Vec<u8>, Vec<u8>)> {
     let mut hdr = [0u8; 5];
     s.read_exact(&mut hdr).context("read record header")?;
     let ct = hdr[0];
@@ -62,18 +80,26 @@ fn read_tls_record(s: &mut TcpStream) -> Result<(u8, u16, Vec<u8>)> {
     }
     let mut payload = vec![0u8; len];
     s.read_exact(&mut payload).context("read record payload")?;
-    Ok((ct, ver, payload))
+    let mut raw = Vec::with_capacity(5 + len);
+    raw.extend_from_slice(&hdr);
+    raw.extend_from_slice(&payload);
+    Ok((ct, ver, payload, raw))
 }
 
-fn write_tls_record(s: &mut TcpStream, ct: u8, ver: u16, payload: &[u8]) -> Result<()> {
-    let mut hdr = [0u8; 5];
-    hdr[0] = ct;
-    hdr[1..3].copy_from_slice(&ver.to_be_bytes());
-    hdr[3..5].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-    s.write_all(&hdr).context("write record header")?;
-    s.write_all(payload).context("write record payload")?;
+fn build_tls_record(ct: u8, ver: u16, payload: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(5 + payload.len());
+    raw.push(ct);
+    raw.extend_from_slice(&ver.to_be_bytes());
+    raw.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    raw.extend_from_slice(payload);
+    raw
+}
+
+fn write_tls_record(s: &mut TcpStream, ct: u8, ver: u16, payload: &[u8]) -> Result<Vec<u8>> {
+    let raw = build_tls_record(ct, ver, payload);
+    s.write_all(&raw).context("write record")?;
     s.flush().context("flush")?;
-    Ok(())
+    Ok(raw)
 }
 
 fn main() -> Result<()> {
@@ -189,31 +215,38 @@ fn main() -> Result<()> {
 
     // Open ONE swanky channel for the whole session — multiple Channel::with
     // calls would lose buffered bytes between operations.
-    let full_plaintext: Vec<u8> = Channel::with(&mut notary_tcp, |ch| -> swanky_error::Result<_> {
+    let mut raw_outbound: Vec<u8> = Vec::new();
+    let mut raw_inbound: Vec<u8> = Vec::new();
+    let session_result = Channel::with(&mut notary_tcp, |ch| -> swanky_error::Result<_> {
         // Encrypt request via 2PC; send the resulting record to the server.
         let (ct, tag) = client_encrypt_record(ch, k_c_tx, tx_iv, &inner, &aad, tx_seq)?;
         tx_seq += 1;
         let mut record_payload = ct.clone();
         record_payload.extend_from_slice(&tag);
-        if let Err(e) = write_tls_record(&mut tcp, 0x17, 0x0303, &record_payload) {
-            swanky_error::bail!(
-                swanky_error::ErrorKind::NetworkError,
-                "write request: {e}"
-            );
-        }
-        eprintln!("phase 4: request record sent");
+        let req_raw = match write_tls_record(&mut tcp, 0x17, 0x0303, &record_payload) {
+            Ok(raw) => raw,
+            Err(e) => {
+                swanky_error::bail!(
+                    swanky_error::ErrorKind::NetworkError,
+                    "write request: {e}"
+                );
+            }
+        };
+        raw_outbound.extend_from_slice(&req_raw);
+        eprintln!("phase 4: request record sent ({} bytes on wire)", req_raw.len());
 
         // ── Phase 5: read response records, decrypt each via 2PC ──────
         let mut full = Vec::new();
         eprintln!("phase 5: reading response records");
         loop {
-            let (ct_kind, _ver, payload) = match read_tls_record(&mut tcp) {
+            let (ct_kind, _ver, payload, raw) = match read_tls_record(&mut tcp) {
                 Ok(rec) => rec,
                 Err(e) => {
                     eprintln!("record read ended: {e}");
                     break;
                 }
             };
+            raw_inbound.extend_from_slice(&raw);
             if ct_kind != 0x17 {
                 eprintln!(
                     "unexpected record content type 0x{:02x}, stopping",
@@ -253,14 +286,75 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Ok(full)
+
+        // Ask the notary to sign the session bundle.
+        let session_id = format!(
+            "demo-{}-{}",
+            host,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+        eprintln!("phase 6: requesting signed bundle from notary");
+        let bundle = client_finish_session(ch, &session_id, &host)?;
+        Ok((full, bundle))
     })
     .map_err(|e| anyhow::anyhow!("notary session: {e:#}"))?;
+    let (full_plaintext, bundle) = session_result;
     drop(notary_tcp);
 
     let body = String::from_utf8_lossy(&full_plaintext);
     println!("--- response ({} bytes) ---", full_plaintext.len());
     println!("{body}");
+
+    println!("--- notary bundle ---");
+    println!("  notary_pubkey:  {}", hex_encode(&bundle.notary_pubkey));
+    println!("  timestamp_unix: {}", bundle.timestamp_unix);
+    println!("  session_id:     {}", bundle.session_id);
+    println!("  server_name:    {}", bundle.server_name);
+    println!("  records:        {}", bundle.records.len());
+    for r in &bundle.records {
+        let op_label = match r.op {
+            0x01 => "encrypt",
+            0x02 => "decrypt",
+            _ => "?",
+        };
+        println!(
+            "    [{}] seq={} aad_len={} commit={}",
+            op_label,
+            r.seq,
+            r.aad.len(),
+            hex_encode(&r.commit_hash)
+        );
+    }
+    println!("  signature:      {}", hex_encode(&bundle.signature));
+    println!(
+        "  verify():       {}",
+        if bundle.verify() { "ok" } else { "FAIL" }
+    );
+
+    // Optional: write a TlsWitness file for the SP1 guest to consume.
+    if let Some(out) = args.witness_out.as_ref() {
+        use sp1_demo_common::{NotaryAttestation, TlsWitness};
+        let witness = TlsWitness {
+            esk_client: [0u8; 32], // unused in notary mode
+            raw_inbound,
+            raw_outbound,
+            hostname: host.clone(),
+            json_field: args.field.clone(),
+            threshold: args.threshold,
+            notary: Some(NotaryAttestation { bundle, k_c_tx, k_c_rx }),
+        };
+        let bytes = bincode::serialize(&witness).context("serialize TlsWitness")?;
+        std::fs::write(out, &bytes)
+            .with_context(|| format!("write witness {}", out.display()))?;
+        eprintln!(
+            "wrote SP1 witness ({} bytes) to {}",
+            bytes.len(),
+            out.display()
+        );
+    }
 
     // Zero shares before exit (best-effort).
     let mut k_c_tx_z = k_c_tx;
@@ -292,6 +386,14 @@ fn aes128_gcm_from_secrets(
         }
         _ => bail!("expected AES-128-GCM secrets (TLS_AES_128_GCM_SHA256), got something else"),
     }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 // Silence unused-warning for AeadKey/zeroize-related imports if the compiler complains.

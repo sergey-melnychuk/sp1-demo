@@ -129,6 +129,7 @@ fn main() -> Result<()> {
         hostname: host.clone(),
         json_field: args.field.clone(),
         threshold: args.threshold,
+        notary: None,
     };
 
     let mut stdin = SP1Stdin::new();

@@ -792,6 +792,7 @@ dependencies = [
  "rustls",
  "serde",
  "sha2 0.10.9",
+ "sp1-demo-common",
  "swanky-channel",
  "swanky-error",
  "swanky-ot-chou-orlandi",
@@ -1142,6 +1143,14 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "sp1-demo-common"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "serde",
+]
 
 [[package]]
 name = "spki"

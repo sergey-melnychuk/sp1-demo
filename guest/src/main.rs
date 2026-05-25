@@ -22,6 +22,15 @@ use x509_cert::Certificate;
 pub fn main() {
     let witness: TlsWitness = sp1_zkvm::io::read();
 
+    // Notary-attested path: skip the X25519/HKDF/handshake-verification flow.
+    // The notary's Ed25519 signature attests to the session; we just need to
+    // verify the signature, check each ciphertext's commit hash matches the
+    // signed record, reconstruct K = K_N XOR K_C, decrypt, and run the claim.
+    if witness.notary.is_some() {
+        run_notary_path(&witness);
+        return;
+    }
+
     // -----------------------------------------------------------------------
     // 1. Parse ClientHello key_share → epk_client_wire.  RFC 8446 §4.1.2, §4.2.8
     //    Assert epk_client_wire == esk_client × G.
@@ -481,6 +490,125 @@ pub fn main() {
     sp1_zkvm::io::commit(&PublicClaim {
         host: witness.hostname,
         field: witness.json_field,
+        threshold: witness.threshold,
+        value: field_value,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Notary-attested path: skip all handshake derivation, trust the bundle's
+// signature, reconstruct K = K_N XOR K_C, decrypt records, claim.
+// ---------------------------------------------------------------------------
+
+fn run_notary_path(witness: &TlsWitness) {
+    let att = witness
+        .notary
+        .as_ref()
+        .expect("run_notary_path called without notary attestation");
+
+    // 1. Verify the notary's Ed25519 signature over the bundle.
+    assert!(
+        att.bundle.verify(),
+        "notary bundle signature did not verify"
+    );
+
+    // 2. Bundle's server_name must match the hostname we're claiming about.
+    assert_eq!(
+        att.bundle.server_name, witness.hostname,
+        "bundle.server_name != witness.hostname"
+    );
+
+    // 3. Reconstruct rx side key. K = K_N XOR K_C.
+    let mut k_rx = [0u8; 16];
+    for i in 0..16 {
+        k_rx[i] = att.bundle.k_n_rx[i] ^ att.k_c_rx[i];
+    }
+    let iv_rx = att.bundle.iv_rx;
+
+    // 4. Walk raw_inbound; for each application_data record, check the
+    //    notary's commit_hash matches SHA-256(payload), then decrypt with K_rx.
+    let records = parse_records(&witness.raw_inbound);
+    let mut plaintext = Vec::new();
+    let mut rx_seq: u64 = 0;
+
+    for r in &records {
+        if r.content_type != 23 {
+            continue; // only encrypted application records carry app data in TLS 1.3
+        }
+
+        let commit_hash: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(&r.payload);
+            h.finalize().into()
+        };
+        let bundle_rec = att
+            .bundle
+            .records
+            .iter()
+            .find(|br| br.op == 0x02 && br.seq == rx_seq)
+            .expect("notary did not commit to this decrypt record (op=0x02)");
+        assert_eq!(
+            commit_hash, bundle_rec.commit_hash,
+            "record at rx_seq={} doesn't match bundle commit",
+            rx_seq
+        );
+
+        // AAD = the 5-byte TLS record header (RFC 8446 §5.2).
+        let aad = {
+            let mut h = [0u8; 5];
+            h[0] = r.content_type;
+            h[1..3].copy_from_slice(&r.legacy_version.to_be_bytes());
+            h[3..5].copy_from_slice(&(r.payload.len() as u16).to_be_bytes());
+            h
+        };
+
+        let nonce = xor_nonce(&iv_rx, rx_seq);
+        rx_seq += 1;
+
+        // ciphertext_payload = ct || tag (tag is 16 bytes for AES-128-GCM)
+        let tag_start = r.payload.len() - 16;
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&r.payload[tag_start..]);
+        let mut buf = r.payload[..tag_start].to_vec();
+
+        <Aes128Gcm as KeyInit>::new(&k_rx.into())
+            .decrypt_in_place_detached(nonce.as_ref().into(), &aad, &mut buf, &tag.into())
+            .expect("notarized AES-GCM auth failed");
+
+        // Strip trailing zeros then the inner content type (TLS 1.3 §5.2).
+        while buf.last() == Some(&0u8) {
+            buf.pop();
+        }
+        let Some(inner_ct) = buf.pop() else {
+            panic!("empty decrypted notarized record");
+        };
+        if inner_ct == 23 {
+            plaintext.extend_from_slice(&buf);
+        }
+    }
+
+    // 5. Parse HTTP + JSON + threshold check (same as the self-proving path).
+    let response = String::from_utf8(plaintext).expect("response not UTF-8");
+    let raw_body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    let body = unchunk(raw_body);
+    let json: serde_json::Value =
+        serde_json::from_str(&body).expect("body is not valid JSON");
+    let field_value = json
+        .pointer(&witness.json_field)
+        .unwrap_or_else(|| panic!("field '{}' not found", witness.json_field))
+        .as_f64()
+        .unwrap_or_else(|| panic!("field '{}' is not a number", witness.json_field));
+    assert!(
+        field_value > witness.threshold,
+        "{} = {} is not > {}",
+        witness.json_field,
+        field_value,
+        witness.threshold
+    );
+
+    sp1_zkvm::io::commit(&PublicClaim {
+        host: witness.hostname.clone(),
+        field: witness.json_field.clone(),
         threshold: witness.threshold,
         value: field_value,
     });

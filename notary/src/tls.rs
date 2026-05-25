@@ -24,13 +24,19 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 
+use ed25519_dalek::SigningKey;
 use rustls::crypto::cipher::{
     InboundOpaqueMessage, InboundPlainMessage, MessageDecrypter, MessageEncrypter,
     OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload, make_tls13_aad,
 };
 use rustls::{ContentType, Error, ProtocolVersion};
+use sha2::{Digest, Sha256};
 use swanky_channel::Channel;
 use swanky_error::Result as SwankyResult;
+
+// NotaryBundle / RecordCommit are defined in `sp1-demo-common` so the SP1
+// guest can verify the same struct without depending on this crate.
+pub use sp1_demo_common::{NotaryBundle, RecordCommit};
 
 use crate::aes::{
     NotaryCommit, client_decrypt_gcm_2pc, client_encrypt_gcm, notary_decrypt_gcm,
@@ -160,6 +166,7 @@ impl NotaryTlsSession {
 
 const OP_ENCRYPT: u8 = 0x01;
 const OP_DECRYPT: u8 = 0x02;
+const OP_FINISH: u8 = 0x03;
 
 struct Header {
     op: u8,
@@ -197,14 +204,8 @@ fn read_header(ch: &mut Channel) -> SwankyResult<Header> {
     Ok(Header { op: op[0], seq, aad, payload_len })
 }
 
-/// Drive the notary side of 2PC AES-GCM for as long as the channel produces
-/// frame headers. Exits cleanly on connection close (Err on `read_header`).
-///
-/// `k_n_tx`/`iv_tx` are used when the prover requests an encrypt (its outbound
-/// records); `k_n_rx`/`iv_rx` are used for decrypt (its inbound records).
-/// TLS 1.3 uses separate keys per direction (RFC 8446 §7.3).
-///
-/// For tests where direction doesn't matter, pass the same key for both.
+/// Drive the notary side of 2PC AES-GCM. See [`run_notary_worker_attested`]
+/// for the variant that signs a session bundle at OP_FINISH.
 pub fn run_notary_worker(
     channel: &mut Channel,
     k_n_tx: [u8; 16],
@@ -212,10 +213,37 @@ pub fn run_notary_worker(
     k_n_rx: [u8; 16],
     iv_rx: [u8; 12],
 ) -> SwankyResult<()> {
+    run_notary_worker_inner(channel, None, k_n_tx, iv_tx, k_n_rx, iv_rx).map(|_| ())
+}
+
+/// Like [`run_notary_worker`] but also tracks a session log and signs a
+/// [`NotaryBundle`] when the prover sends OP_FINISH.
+///
+/// Returns the bundle that was signed (and already written to the channel).
+pub fn run_notary_worker_attested(
+    channel: &mut Channel,
+    signing_key: &SigningKey,
+    k_n_tx: [u8; 16],
+    iv_tx: [u8; 12],
+    k_n_rx: [u8; 16],
+    iv_rx: [u8; 12],
+) -> SwankyResult<Option<NotaryBundle>> {
+    run_notary_worker_inner(channel, Some(signing_key), k_n_tx, iv_tx, k_n_rx, iv_rx)
+}
+
+fn run_notary_worker_inner(
+    channel: &mut Channel,
+    signing_key: Option<&SigningKey>,
+    k_n_tx: [u8; 16],
+    iv_tx: [u8; 12],
+    k_n_rx: [u8; 16],
+    iv_rx: [u8; 12],
+) -> SwankyResult<Option<NotaryBundle>> {
+    let mut records: Vec<RecordCommit> = Vec::new();
     loop {
         let header = match read_header(channel) {
             Ok(h) => h,
-            Err(_) => return Ok(()), // peer closed
+            Err(_) => return Ok(None), // peer closed
         };
         match header.op {
             OP_ENCRYPT => {
@@ -227,6 +255,13 @@ pub fn run_notary_worker(
                     &header.aad,
                     header.payload_len as usize,
                 )?;
+                let commit_hash = read_commit(channel, header.payload_len as usize)?;
+                records.push(RecordCommit {
+                    op: header.op,
+                    seq: header.seq,
+                    aad: header.aad.clone(),
+                    commit_hash,
+                });
             }
             OP_DECRYPT => {
                 let nonce = tls13_nonce(&iv_rx, header.seq);
@@ -237,6 +272,69 @@ pub fn run_notary_worker(
                     header.aad.len(),
                     header.payload_len as usize,
                 )?;
+                let commit_hash = read_commit(channel, header.payload_len as usize)?;
+                records.push(RecordCommit {
+                    op: header.op,
+                    seq: header.seq,
+                    aad: header.aad.clone(),
+                    commit_hash,
+                });
+            }
+            OP_FINISH => {
+                // session_id_len (2 BE) || session_id || server_name_len (2 BE) || server_name
+                let mut sid_len = [0u8; 2];
+                channel.read_bytes(&mut sid_len)?;
+                let mut sid_buf = vec![0u8; u16::from_be_bytes(sid_len) as usize];
+                channel.read_bytes(&mut sid_buf)?;
+                let session_id = String::from_utf8(sid_buf).map_err(|_| {
+                    swanky_error::swanky_error!(
+                        swanky_error::ErrorKind::OtherError,
+                        "session_id is not valid UTF-8"
+                    )
+                })?;
+                let mut sn_len = [0u8; 2];
+                channel.read_bytes(&mut sn_len)?;
+                let mut sn_buf = vec![0u8; u16::from_be_bytes(sn_len) as usize];
+                channel.read_bytes(&mut sn_buf)?;
+                let server_name = String::from_utf8(sn_buf).map_err(|_| {
+                    swanky_error::swanky_error!(
+                        swanky_error::ErrorKind::OtherError,
+                        "server_name is not valid UTF-8"
+                    )
+                })?;
+
+                let Some(sk) = signing_key else {
+                    swanky_error::bail!(
+                        swanky_error::ErrorKind::OtherError,
+                        "received OP_FINISH but the notary was not configured with a signing key"
+                    );
+                };
+
+                let bundle = NotaryBundle::sign(
+                    sk,
+                    session_id,
+                    server_name,
+                    records,
+                    k_n_tx,
+                    iv_tx,
+                    k_n_rx,
+                    iv_rx,
+                );
+                let serialized = bincode::serialize(&bundle).map_err(|e| {
+                    swanky_error::swanky_error!(
+                        swanky_error::ErrorKind::OtherError,
+                        "bincode serialize bundle: {e}"
+                    )
+                })?;
+                channel.write_bytes(&(serialized.len() as u32).to_be_bytes())?;
+                channel.write_bytes(&serialized)?;
+                channel.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(
+                        swanky_error::ErrorKind::NetworkError,
+                        "flush: {e}"
+                    )
+                })?;
+                return Ok(Some(bundle));
             }
             other => {
                 swanky_error::bail!(
@@ -247,6 +345,19 @@ pub fn run_notary_worker(
             }
         }
     }
+}
+
+/// Read `payload_len` bytes of ciphertext + 16 bytes of tag from the channel
+/// and return `SHA-256(ct || tag)`.
+fn read_commit(channel: &mut Channel, payload_len: usize) -> SwankyResult<[u8; 32]> {
+    let mut ct = vec![0u8; payload_len];
+    channel.read_bytes(&mut ct)?;
+    let mut tag = [0u8; 16];
+    channel.read_bytes(&mut tag)?;
+    let mut h = Sha256::new();
+    h.update(&ct);
+    h.update(tag);
+    Ok(h.finalize().into())
 }
 
 enum ClientJob {
@@ -390,7 +501,14 @@ fn encrypt_one(
         },
     )?;
     let nonce = tls13_nonce(&base_iv, seq);
-    client_encrypt_gcm(ch, k_c, plaintext, aad, nonce)
+    let (ct, tag) = client_encrypt_gcm(ch, k_c, plaintext, aad, nonce)?;
+    // Send ciphertext + tag so the notary can commit to them in its log.
+    ch.write_bytes(&ct)?;
+    ch.write_bytes(&tag)?;
+    ch.force_flush().map_err(|e| {
+        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "flush: {e}")
+    })?;
+    Ok((ct, tag))
 }
 
 fn decrypt_one(
@@ -412,7 +530,51 @@ fn decrypt_one(
         },
     )?;
     let nonce = tls13_nonce(&base_iv, seq);
-    client_decrypt_gcm_2pc(ch, k_c, ciphertext, aad, tag, nonce)
+    let plaintext = client_decrypt_gcm_2pc(ch, k_c, ciphertext, aad, tag, nonce)?;
+    // Same commit: notary needs the same ct+tag bytes to compute the hash.
+    ch.write_bytes(ciphertext)?;
+    ch.write_bytes(&tag)?;
+    ch.force_flush().map_err(|e| {
+        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "flush: {e}")
+    })?;
+    Ok(plaintext)
+}
+
+/// Send OP_FINISH and read back the signed [`NotaryBundle`] from the notary.
+/// Must be called on the same channel that ran the session's 2PC operations.
+pub fn client_finish_session(
+    ch: &mut Channel,
+    session_id: &str,
+    server_name: &str,
+) -> SwankyResult<NotaryBundle> {
+    write_header(
+        ch,
+        &Header { op: OP_FINISH, seq: 0, aad: Vec::new(), payload_len: 0 },
+    )?;
+    ch.write_bytes(&(session_id.len() as u16).to_be_bytes())?;
+    ch.write_bytes(session_id.as_bytes())?;
+    ch.write_bytes(&(server_name.len() as u16).to_be_bytes())?;
+    ch.write_bytes(server_name.as_bytes())?;
+    ch.force_flush().map_err(|e| {
+        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "flush: {e}")
+    })?;
+    let mut len_buf = [0u8; 4];
+    ch.read_bytes(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 16 * 1024 * 1024 {
+        swanky_error::bail!(
+            swanky_error::ErrorKind::OtherError,
+            "notary bundle suspiciously large: {len} bytes"
+        );
+    }
+    let mut buf = vec![0u8; len];
+    ch.read_bytes(&mut buf)?;
+    bincode::deserialize(&buf).map_err(|e| {
+        swanky_error::swanky_error!(
+            swanky_error::ErrorKind::OtherError,
+            "bincode deserialize bundle: {e}"
+        )
+    })
 }
 
 struct TwoPartyEncrypter {
@@ -649,5 +811,78 @@ mod tests {
         drop(decrypter);
         worker.shutdown().expect("worker shutdown clean");
         notary_handle.join().expect("notary thread join");
+    }
+
+    /// Run an attested session over a local channel pair, then verify the
+    /// signed bundle. Exercises:
+    ///   - per-record commit frames being sent + read by the notary
+    ///   - OP_FINISH frame + bincode bundle round-trip
+    ///   - Ed25519 signature verification
+    #[test]
+    fn notary_bundle_round_trip() {
+        use ed25519_dalek::SigningKey;
+        use rand::RngCore;
+
+        let k_n = [0xaau8; 16];
+        let k_c = [0xbbu8; 16];
+        let iv = [0xccu8; 12];
+
+        let mut seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut seed);
+        let signing_key = SigningKey::from_bytes(&seed);
+        let expected_pubkey = signing_key.verifying_key().to_bytes();
+
+        let (notary_bundle_opt, client_bundle) = local_channel_pair(
+            |ch| {
+                // Notary: drive worker; expect bundle returned at OP_FINISH
+                run_notary_worker_attested(ch, &signing_key, k_n, iv, k_n, iv)
+            },
+            |ch| -> SwankyResult<NotaryBundle> {
+                // Client: do one encrypt + one decrypt + finish.
+                // For a round-trip with the SAME k/iv we must use the SAME
+                // seq for both directions (real TLS uses separate keys
+                // per direction so seqs are independent; this test isn't TLS).
+                let pt = b"hello, attested world";
+                let aad = b"record-aad";
+                let (ct, tag) = encrypt_one(ch, k_c, iv, pt, aad, 0)?;
+                let plain = decrypt_one(ch, k_c, iv, &ct, tag, aad, 0)?;
+                assert_eq!(plain, pt);
+                client_finish_session(ch, "test-session-1", "test.example.com")
+            },
+        )
+        .expect("attested 2PC session");
+
+        let notary_bundle = notary_bundle_opt.expect("notary should have built a bundle");
+
+        // Notary's view and the client's view of the bundle must agree.
+        assert_eq!(notary_bundle.notary_pubkey, client_bundle.notary_pubkey);
+        assert_eq!(notary_bundle.signature, client_bundle.signature);
+        assert_eq!(notary_bundle.records.len(), client_bundle.records.len());
+
+        // Pubkey matches the signing key we set up
+        assert_eq!(client_bundle.notary_pubkey, expected_pubkey);
+
+        // Session metadata is what we passed
+        assert_eq!(client_bundle.session_id, "test-session-1");
+        assert_eq!(client_bundle.server_name, "test.example.com");
+
+        // We did 1 encrypt + 1 decrypt (both at seq=0 for this self-test)
+        assert_eq!(client_bundle.records.len(), 2);
+        assert_eq!(client_bundle.records[0].op, 0x01);
+        assert_eq!(client_bundle.records[0].seq, 0);
+        assert_eq!(client_bundle.records[1].op, 0x02);
+        assert_eq!(client_bundle.records[1].seq, 0);
+
+        // Signature verifies
+        assert!(client_bundle.verify(), "bundle signature must verify");
+
+        // Tampering breaks verification
+        let mut bad = client_bundle.clone();
+        bad.session_id.push('x');
+        assert!(!bad.verify(), "tampered bundle must not verify");
+
+        let mut bad2 = client_bundle.clone();
+        bad2.records[0].commit_hash[0] ^= 0xff;
+        assert!(!bad2.verify(), "tampered commit hash must not verify");
     }
 }

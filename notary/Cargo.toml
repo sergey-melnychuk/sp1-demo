@@ -22,6 +22,7 @@ name = "notary_demo"
 path = "src/bin/notary_demo.rs"
 
 [dependencies]
+sp1-demo-common         = { path = "../common" }
 fancy-garbling          = { git = "https://github.com/GaloisInc/swanky", package = "fancy-garbling" }
 swanky-twopac           = { git = "https://github.com/GaloisInc/swanky", package = "swanky-twopac" }
 swanky-channel          = { git = "https://github.com/GaloisInc/swanky", package = "swanky-channel" }
