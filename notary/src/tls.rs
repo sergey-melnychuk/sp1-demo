@@ -3,7 +3,7 @@
 //! This is the entry point the `host` crate uses when acting as the
 //! prover/notary pair during a zkTLS session. It composes:
 //!
-//! - [`ecdh`]: X25519 additives + XOR-split IKM helpers + `OtX25519Placeholder`.
+//! - [`ecdh`]: X25519 additives + OT-blinded / leaky wire helpers (`OtX25519Blinded`).
 //! - [`hkdf`]: 2PC HKDF-SHA256 — yields each party's share of the AES traffic
 //!   key (`K = K_N XOR K_C`) without either party seeing the full key.
 //! - [`aes`]: split-key AES-128-GCM (encrypt + decrypt) over a swanky channel.
@@ -920,15 +920,15 @@ impl Write for ChannelRw<'_, '_> {
     }
 }
 
-/// After mode-1 IV setup: read host ECDH flag and optionally run leaky additive ECDH.
+/// After mode-1 IV setup: read host ECDH flag and run the selected round.
 pub fn notary_ecdh_after_setup_ivs(
     ch: &mut Channel<'_>,
+    notary_share: &crate::ecdh::EphemeralShare,
     rng: &mut impl rand::RngCore,
-) -> SwankyResult<Option<crate::ecdh::LeakyAdditiveOutcome>> {
-    use crate::ecdh::{generate_share, notary_recv_ecdh_leaky};
+) -> SwankyResult<crate::ecdh::EcdhSetupOutcome> {
+    use crate::ecdh::notary_recv_ecdh_setup;
 
-    let share = generate_share(rng);
     let mut io = ChannelRw(ch);
-    notary_recv_ecdh_leaky(&mut io, &share, rng)
+    notary_recv_ecdh_setup(&mut io, notary_share, rng)
         .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))
 }

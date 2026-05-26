@@ -19,8 +19,9 @@ use std::net::{TcpListener, TcpStream};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use notary::ecdh::{
-    EcdhIkmDriver, LeakyAdditivePointEcdh, generate_share, host_run_leaky_additive,
-    notary_run_leaky_additive,
+    EcdhIkmDriver, LeakyAdditivePointEcdh, OtX25519Blinded, generate_share,
+    host_run_leaky_additive, host_run_ot_blinded, notary_run_leaky_additive,
+    notary_run_ot_blinded,
 };
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -36,13 +37,17 @@ struct Args {
     /// If set, run in-process pipe roundtrip (no network). Useful for CI.
     #[arg(long, conflicts_with_all = ["listen", "connect"])]
     self_test: bool,
+
+    /// With `--self-test`, run OT-blinded protocol instead of leaky additive.
+    #[arg(long)]
+    ot: bool,
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn run_self_test() -> Result<()> {
+fn run_self_test(ot: bool) -> Result<()> {
     use notary::ecdh::reference_ikm;
     use rand::rngs::OsRng;
     use std::io::{Read, Write};
@@ -52,6 +57,7 @@ fn run_self_test() -> Result<()> {
     let server_epk = *PublicKey::from(&server_sk).as_bytes();
     let k_c = generate_share(&mut rng);
     let k_n = generate_share(&mut rng);
+    let expect = reference_ikm(&k_c, &k_n, &server_epk);
 
     let (h2n_r, h2n_w) = std::io::pipe().unwrap();
     let (n2h_r, n2h_w) = std::io::pipe().unwrap();
@@ -74,6 +80,26 @@ fn run_self_test() -> Result<()> {
         }
     }
 
+    if ot {
+        let notary = std::thread::spawn(move || {
+            let mut io = Duplex {
+                r: n2h_r,
+                w: h2n_w,
+            };
+            notary_run_ot_blinded(&k_n, &server_epk, &mut io, &mut rng)
+        });
+        let mut host_io = Duplex {
+            r: h2n_r,
+            w: n2h_w,
+        };
+        let host_out = host_run_ot_blinded(&k_c, &server_epk, &mut host_io)?;
+        let notary_out = notary.join().unwrap()?;
+        assert_eq!(notary_out.ikm.0, expect.0);
+        assert_eq!(host_out.host_ikm_share, notary_out.host_ikm_share);
+        eprintln!("self-test (OT) ok: IKM = {}", hex(&expect.0));
+        return Ok(());
+    }
+
     let notary = std::thread::spawn(move || {
         let mut io = Duplex {
             r: n2h_r,
@@ -89,7 +115,6 @@ fn run_self_test() -> Result<()> {
     let host_out = host_run_leaky_additive(&k_c, &server_epk, &mut host_io)?;
     let notary_out = notary.join().unwrap()?;
 
-    let expect = reference_ikm(&k_c, &k_n, &server_epk);
     assert_eq!(host_out.ikm.0, expect.0);
     assert_eq!(notary_out.ikm.0, expect.0);
     eprintln!("self-test ok: IKM = {}", hex(&expect.0));
@@ -98,12 +123,16 @@ fn run_self_test() -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let driver = LeakyAdditivePointEcdh;
-    eprintln!("driver: {}", driver.name());
-
     if args.self_test {
-        return run_self_test();
+        return run_self_test(args.ot);
     }
+
+    let driver: &dyn EcdhIkmDriver = if args.ot {
+        &OtX25519Blinded
+    } else {
+        &LeakyAdditivePointEcdh
+    };
+    eprintln!("driver: {}", driver.name());
 
     match (args.listen, args.connect) {
         (Some(listen), None) => run_notary(&listen),

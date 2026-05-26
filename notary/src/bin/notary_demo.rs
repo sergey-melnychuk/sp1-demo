@@ -9,7 +9,8 @@
 //!   3. We split each AES traffic key: `K_C = K_full XOR K_N`, **zero the full key**
 //!      from host memory. **Default:** `K_N` is chosen by the notary **before** TLS handshake
 //!      (`--legacy-host-xor-masks` restores host-chosen masks after handshake).
-//!      True 2PC X25519 (IKM never assembled on host) is still TODO.md #1.
+//!      Default mode 1 runs OT-blinded ECDH after IVs (host gets XOR IKM share only).
+//!      Full OT-MtA scalar mult + 2PC HKDF remain TODO.md #1.
 //!   4. From this point on, host has only K_C; notary has K_N; neither has K.
 //!   5. We take over the TcpStream manually: build the HTTP GET, encrypt it
 //!      as a TLS 1.3 record via 2PC AES-GCM, write to the socket. Read
@@ -18,7 +19,7 @@
 //! Trust caveats (all flagged in the codebase already):
 //!   - Handshake is local-only — the host briefly held K (between step 1 and
 //!     the split + zero in step 3). True "host never has K" requires ECDH 2PC
-//!     (`notary::ecdh::OtX25519Placeholder` / workspace `TODO.md` #1).
+//!     (`notary::ecdh::OtX25519Blinded` — host XOR IKM share; rustls still brief full keys).
 //!   - This demo is semi-honest; authenticated garbling not wired in.
 
 use std::io::{Read, Write};
@@ -29,15 +30,18 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use notary::ecdh::{
-    generate_share, host_send_ecdh_leaky, host_skip_ecdh_leaky, parse_server_hello_key_share,
+    combined_client_esk, generate_share, host_send_ecdh_leaky, host_send_ecdh_ot,
+    host_skip_ecdh_leaky, parse_server_hello_key_share, share_from_bytes, EphemeralShare,
 };
 use notary::tls::{
     client_decrypt_record, client_encrypt_record, client_finish_session, tls13_aad,
 };
 use rand::RngCore;
 use rustls::crypto::cipher::AeadKey;
-use rustls::{ClientConfig, ClientConnection};
+use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
+use rustls::{ClientConfig, ClientConnection, Error, NamedGroup};
 use swanky_channel::Channel;
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 /// Setup framing (must stay in sync with `notary_proxy`).
@@ -73,15 +77,20 @@ struct Args {
 
     /// Original demo: host samples XOR masks **after** the handshake (single connection to notary).
     ///
-    /// If **not** set (default), the **notary** sends `K_N_tx || K_N_rx` **before** TLS completes,
-    /// then receives IVs after secret extraction (`OtX25519Placeholder` reminds that true 2PC ECDH
-    /// is TODO.md #1 — rustls still sees full secrets briefly).
+    /// If **not** set (default), the **notary** sends `K_N_tx || K_N_rx` and its scalar share
+    /// **before** TLS; the host injects `(s_host + s_notary)` into ClientHello via
+    /// `ExternalKxGroup`, then runs OT-blinded ECDH after IVs (unless `--skip-ecdh-wire` /
+    /// `--leaky-ecdh-wire`). rustls still briefly holds full AES keys after extract.
     #[arg(long)]
     legacy_host_xor_masks: bool,
 
-    /// Mode 1 only: skip the leaky additive ECDH round after IVs (sends `SETUP_ECDH_SKIP`).
+    /// Mode 1 only: skip the post-IV ECDH round (`SETUP_ECDH_SKIP`).
     #[arg(long)]
     skip_ecdh_wire: bool,
+
+    /// Mode 1 only: use leaky cleartext partial-point ECDH instead of OT-blinded (debug).
+    #[arg(long, conflicts_with = "skip_ecdh_wire")]
+    leaky_ecdh_wire: bool,
 }
 
 /// Wraps a `TcpStream` and records every raw byte in both directions during the TLS handshake.
@@ -123,6 +132,60 @@ impl Write for CapturingStream {
 
 fn xor_key(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
     std::array::from_fn(|i| a[i] ^ b[i])
+}
+
+/// Inject a pre-agreed client X25519 ephemeral into rustls (mode 1).
+struct ExternalKxGroup {
+    esk_client: [u8; 32],
+}
+
+impl std::fmt::Debug for ExternalKxGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExternalKxGroup(X25519)")
+    }
+}
+
+impl SupportedKxGroup for ExternalKxGroup {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+        let secret = StaticSecret::from(self.esk_client);
+        let public = PublicKey::from(&secret);
+        Ok(Box::new(ExternalActiveKx { secret, public }))
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::X25519
+    }
+}
+
+struct ExternalActiveKx {
+    secret: StaticSecret,
+    public: PublicKey,
+}
+
+impl ActiveKeyExchange for ExternalActiveKx {
+    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+        let server_pub_bytes = <[u8; 32]>::try_from(peer_pub_key)
+            .map_err(|_| Error::General("X25519: peer key must be 32 bytes".into()))?;
+        let server_pub = PublicKey::from(server_pub_bytes);
+        let shared = self.secret.diffie_hellman(&server_pub);
+        Ok(SharedSecret::from(shared.as_bytes().as_slice()))
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        self.public.as_bytes()
+    }
+
+    fn group(&self) -> NamedGroup {
+        NamedGroup::X25519
+    }
+}
+
+fn make_provider(esk_client: [u8; 32]) -> rustls::crypto::CryptoProvider {
+    let kx: &'static dyn SupportedKxGroup = Box::leak(Box::new(ExternalKxGroup { esk_client }));
+    rustls::crypto::CryptoProvider {
+        kx_groups: vec![kx],
+        ..rustls::crypto::ring::default_provider()
+    }
 }
 
 /// Read one TLS record from a stream: 5-byte header + payload.
@@ -176,9 +239,49 @@ fn main() -> Result<()> {
         None => path.to_string(),
     };
 
-    // ── Phase 1: TLS 1.3 handshake (uses standard ring AEAD) ──────────────
-    let mut provider = rustls::crypto::ring::default_provider();
+    // ── Phase 0 / 1: notary setup + TLS 1.3 handshake ─────────────────────
+    let mut k_n_tx = [0u8; 16];
+    let mut k_n_rx = [0u8; 16];
+    let mut notary_pre_tls: Option<TcpStream> = None;
+    let mut host_ecdh_share: Option<EphemeralShare> = None;
+
+    let mut provider = if args.legacy_host_xor_masks {
+        rustls::crypto::ring::default_provider()
+    } else {
+        make_provider([0u8; 32]) // replaced after notary scalar share arrives
+    };
     provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+
+    if !args.legacy_host_xor_masks {
+        eprintln!(
+            "phase 0a: connect notary for XOR masks + scalar share {}",
+            args.notary
+        );
+        let mut nm = TcpStream::connect(&args.notary)
+            .with_context(|| format!("connect to notary {}", args.notary))?;
+        nm.set_nodelay(true)?;
+        nm.write_all(&[SETUP_NOTARY_CHOOSES_XOR_MASKS])
+            .context("write setup mode")?;
+        nm.flush().context("flush setup mode")?;
+        let mut kn = [0u8; 32];
+        nm.read_exact(&mut kn).context("read notary XOR mask frame")?;
+        let mut notary_scalar = [0u8; 32];
+        nm.read_exact(&mut notary_scalar)
+            .context("read notary scalar share")?;
+        k_n_tx.copy_from_slice(&kn[..16]);
+        k_n_rx.copy_from_slice(&kn[16..32]);
+        let notary_share = share_from_bytes(&notary_scalar);
+        let host_share = generate_share(&mut rand::thread_rng());
+        host_ecdh_share = Some(host_share);
+        let esk = combined_client_esk(&host_share, &notary_share);
+        provider = make_provider(esk);
+        provider.cipher_suites =
+            vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+        eprintln!(
+            "phase 0a: notary XOR masks + scalar share received — ClientHello uses split ephemeral"
+        );
+        notary_pre_tls = Some(nm);
+    }
 
     let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -190,33 +293,6 @@ fn main() -> Result<()> {
 
     let server_name: rustls::pki_types::ServerName =
         host.clone().try_into().context("invalid server name")?;
-
-    // Notary XOR masks sampled by the notary *before* we finish TLS — ensures the notary’s share
-    // exists independently of rustls-derived keys (still does not implement OT-based ECDH).
-    let mut k_n_tx = [0u8; 16];
-    let mut k_n_rx = [0u8; 16];
-    let mut notary_pre_tls: Option<TcpStream> = None;
-
-    if !args.legacy_host_xor_masks {
-        eprintln!(
-            "phase 0a: connect notary for notary-chosen XOR masks {}",
-            args.notary
-        );
-        let mut nm = TcpStream::connect(&args.notary)
-            .with_context(|| format!("connect to notary {}", args.notary))?;
-        nm.set_nodelay(true)?;
-        nm.write_all(&[SETUP_NOTARY_CHOOSES_XOR_MASKS])
-            .context("write setup mode")?;
-        nm.flush().context("flush setup mode")?;
-        let mut kn = [0u8; 32];
-        nm.read_exact(&mut kn).context("read notary XOR mask frame")?;
-        k_n_tx.copy_from_slice(&kn[..16]);
-        k_n_rx.copy_from_slice(&kn[16..32]);
-        eprintln!(
-            "phase 0a: XOR mask halves received — 2PC AES path will use rustls-derived keys XOR these"
-        );
-        notary_pre_tls = Some(nm);
-    }
 
     eprintln!("phase 1: TCP+TLS handshake to {host}:{port}");
     let tcp = TcpStream::connect(format!("{host}:{port}"))?;
@@ -268,7 +344,7 @@ fn main() -> Result<()> {
     // ── Phase 3: XOR-split AES traffic keys ─────────────────────────────────
     //
     // K_full = K_C ⊕ K_N. After zeroize neither side holds both halves unless they collude.
-    // ECDH+Hkdf still ran inside rustls — OtX25519Placeholder / TODO.md #1 for true 2PC IKM.
+    // ECDH still completes inside rustls; OT-blinded round gives host XOR IKM share only.
 
     let k_c_tx = xor_key(&tx_key, &k_n_tx);
     let k_c_rx = xor_key(&rx_key, &k_n_rx);
@@ -283,21 +359,34 @@ fn main() -> Result<()> {
         nm.write_all(&rx_iv).context("write IV_rx")?;
         nm.flush().context("flush IVs")?;
         if args.skip_ecdh_wire {
-            eprintln!("phase 3b: skipping leaky ECDH wire (--skip-ecdh-wire)");
+            eprintln!("phase 3b: skipping ECDH wire (--skip-ecdh-wire)");
             host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
             nm.flush().context("flush ECDH skip")?;
         } else if let Some(epk) = server_epk {
-            eprintln!("phase 3b: leaky additive ECDH (server epk from ServerHello)");
-            let host_share = generate_share(&mut rand::thread_rng());
-            let outcome =
-                host_send_ecdh_leaky(&mut nm, &host_share, &epk).context("leaky ECDH wire")?;
-            nm.flush().context("flush leaky ECDH")?;
-            eprintln!(
-                "phase 3b: host-side IKM={} (both parties learn full IKM — demo only)",
-                hex_encode(&outcome.ikm.0)
-            );
+            let host_share = host_ecdh_share
+                .as_ref()
+                .context("mode 1 requires host ECDH share from phase 0a")?;
+            if args.leaky_ecdh_wire {
+                eprintln!("phase 3b: leaky additive ECDH (debug — cleartext partials)");
+                let outcome =
+                    host_send_ecdh_leaky(&mut nm, host_share, &epk).context("leaky ECDH wire")?;
+                nm.flush().context("flush leaky ECDH")?;
+                eprintln!(
+                    "phase 3b: host-side IKM={} (both parties learn full IKM)",
+                    hex_encode(&outcome.ikm.0)
+                );
+            } else {
+                eprintln!("phase 3b: OT-blinded ECDH (server epk from ServerHello)");
+                let outcome =
+                    host_send_ecdh_ot(&mut nm, host_share, &epk).context("OT ECDH wire")?;
+                nm.flush().context("flush OT ECDH")?;
+                eprintln!(
+                    "phase 3b: host XOR IKM share={} (full IKM not sent to host)",
+                    hex_encode(&outcome.host_ikm_share)
+                );
+            }
         } else {
-            eprintln!("phase 3b: no ServerHello key_share in capture — skipping leaky ECDH");
+            eprintln!("phase 3b: no ServerHello key_share in capture — skipping ECDH");
             host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
             nm.flush().context("flush ECDH skip")?;
         }

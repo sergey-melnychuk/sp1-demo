@@ -13,13 +13,13 @@ the server has no idea anything unusual happened.
 > **Caveat:** the handshake still runs through stock rustls + ring AEAD, so the host
 > _briefly_ holds the full AES traffic keys between `dangerous_extract_secrets()`
 > and `zeroize()`. Closing that gap needs **real 2PC X25519 / key schedule**
-> (`TODO.md` #1, `OtX25519Placeholder` in [`notary/src/ecdh.rs`](notary/src/ecdh.rs)).
+> (`TODO.md` #1 MtA; default is [`OtX25519Blinded`](notary/src/ecdh.rs) — see [`ECDH.md` § Protocol](ECDH.md#protocol)).
 >
 > **Notary vs host XOR-mask role (default demo):** `notary_proxy` reads a **mode byte**.
-> Mode **`1`** (default for `notary_demo`): notary sends random `K_N_tx||K_N_rx` **before**
-> the HTTPS TLS handshake finishes; host XOR-splits after extract and uploads IVs, then runs a
-> **leaky additive ECDH** round (both sides log matching `IKM=` — plumbing only, see
-> [`notary/doc/PROTOCOL_ECDH.md`](notary/doc/PROTOCOL_ECDH.md)). Mode **`0`**:
+//!   3. We split each AES traffic key: `K_C = K_full XOR K_N`, **zero the full key**
+//!      from host memory. **Default:** notary sends XOR masks + scalar share before TLS;
+//!      ClientHello uses split ephemeral; post-IV **OT-blinded ECDH** gives host an XOR
+//!      IKM share only (`--leaky-ecdh-wire` for debug cleartext partials).
 > `--legacy-host-xor-masks` — original single 56-byte host→notary setup (masks + IVs after handshake).
 
 ## Quick start
@@ -51,8 +51,8 @@ phase 0a: XOR mask halves received ...
 phase 1: TCP+TLS handshake to jsonplaceholder.typicode.com:443
 phase 2: traffic secrets extracted (tx_seq=0, rx_seq=0)
 phase 3: finalizing setup with notary at 127.0.0.1:9001
-phase 3b: leaky additive ECDH (server epk from ServerHello)
-phase 3b: host-side IKM=... (both parties learn full IKM — demo only)
+phase 3b: OT-blinded ECDH (server epk from ServerHello)
+phase 3b: host XOR IKM share=... (full IKM not sent to host)
 phase 4: encrypting 93 bytes of HTTP request via 2PC AES-GCM
 phase 4: request record sent
 phase 5: reading response records

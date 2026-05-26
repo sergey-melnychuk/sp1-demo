@@ -4,10 +4,9 @@
 //!
 //! - **`0` — legacy:** prover sends **`K_N_tx (16) || IV_tx (12) || K_N_rx (16) || IV_rx (12)`**
 //!   (56 bytes). Same as the original demo (host chose random XOR masks).
-//! - **`1` — notary-chosen XOR masks:** notary samples `K_N_tx || K_N_rx` (32 bytes) and sends them
-//!   to the prover *before* TLS traffic keys exist on the wire; after the prover finishes the TLS
-//!   handshake it sends **`IV_tx (12) || IV_rx (12)`** (24 bytes), then optionally runs the leaky
-//!   additive ECDH round (`SETUP_ECDH_LEAKY` + partial points — see `notary::ecdh`).
+//! - **`1` — notary-chosen XOR masks:** notary samples `K_N_tx || K_N_rx` (32 bytes) and its
+//!   additive X25519 scalar share (32 bytes), sends both **before** TLS; after IVs the host runs
+//!   OT-blinded ECDH by default (`SETUP_ECDH_OT`) or leaky/skip per host flags.
 //!
 //! Then runs [`notary::tls::run_notary_worker_attested`] until the prover sends
 //!      OP_FINISH (in which case the notary signs and returns the bundle) or
@@ -28,6 +27,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
+use notary::ecdh::{self, share_to_bytes, EcdhSetupOutcome};
 use notary::tls::{notary_ecdh_after_setup_ivs, run_notary_worker_attested};
 use rand::RngCore;
 use swanky_channel::Channel;
@@ -80,7 +80,7 @@ const SETUP_NOTARY_CHOOSES_XOR_MASKS: u8 = 1;
 fn read_setup_frame(
     ch: &mut Channel,
     peer: &str,
-) -> swanky_error::Result<([u8; 16], [u8; 12], [u8; 16], [u8; 12])> {
+) -> swanky_error::Result<(ecdh::EphemeralShare, [u8; 16], [u8; 12], [u8; 16], [u8; 12])> {
     let mut mode = [0u8; 1];
     ch.read_bytes(&mut mode)?;
     match mode[0] {
@@ -98,39 +98,48 @@ fn read_setup_frame(
             eprintln!(
                 "notary_proxy: setup LEGACY host-chosen XOR masks received from {peer}"
             );
-            Ok((k_n_tx, iv_tx, k_n_rx, iv_rx))
+            let ecdh_share = ecdh::generate_share(&mut rand::thread_rng());
+            Ok((ecdh_share, k_n_tx, iv_tx, k_n_rx, iv_rx))
         }
         SETUP_NOTARY_CHOOSES_XOR_MASKS => {
             let mut k_n_tx = [0u8; 16];
             let mut k_n_rx = [0u8; 16];
             rand::thread_rng().fill_bytes(&mut k_n_tx);
             rand::thread_rng().fill_bytes(&mut k_n_rx);
+            let ecdh_share = ecdh::generate_share(&mut rand::thread_rng());
             let mut kn = [0u8; 32];
             kn[..16].copy_from_slice(&k_n_tx);
             kn[16..].copy_from_slice(&k_n_rx);
             ch.write_bytes(&kn)?;
+            ch.write_bytes(&share_to_bytes(&ecdh_share))?;
             ch.force_flush().map_err(|e| {
                 swanky_error::swanky_error!(
                     swanky_error::ErrorKind::NetworkError,
-                    "flush K_N after notary-chosen masks: {e}"
+                    "flush setup after notary-chosen masks: {e}"
                 )
             })?;
             eprintln!(
-                "notary_proxy: pushed notary-chosen XOR masks ({peer}), waiting for IVs"
+                "notary_proxy: pushed XOR masks + scalar share ({peer}), waiting for IVs"
             );
             let mut iv_tx = [0u8; 12];
             let mut iv_rx = [0u8; 12];
             ch.read_bytes(&mut iv_tx)?;
             ch.read_bytes(&mut iv_rx)?;
             eprintln!("notary_proxy: IVs received from {peer}");
-            match notary_ecdh_after_setup_ivs(ch, &mut rand::thread_rng())? {
-                Some(outcome) => eprintln!(
+            match notary_ecdh_after_setup_ivs(ch, &ecdh_share, &mut rand::thread_rng())? {
+                EcdhSetupOutcome::Skipped => {
+                    eprintln!("notary_proxy: ECDH skipped by host ({peer})");
+                }
+                EcdhSetupOutcome::Leaky(outcome) => eprintln!(
                     "notary_proxy: leaky additive ECDH — IKM={}",
                     hex_encode(&outcome.ikm.0)
                 ),
-                None => eprintln!("notary_proxy: leaky ECDH skipped by host ({peer})"),
+                EcdhSetupOutcome::Ot(outcome) => eprintln!(
+                    "notary_proxy: OT-blinded ECDH — IKM={} (host holds XOR share only)",
+                    hex_encode(&outcome.ikm.0)
+                ),
             }
-            Ok((k_n_tx, iv_tx, k_n_rx, iv_rx))
+            Ok((ecdh_share, k_n_tx, iv_tx, k_n_rx, iv_rx))
         }
         other => swanky_error::bail!(
             swanky_error::ErrorKind::OtherError,
@@ -145,7 +154,7 @@ fn handle(stream: TcpStream, signing_key: Arc<SigningKey>) -> swanky_error::Resu
         stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<?>".into());
     eprintln!("notary_proxy: connection from {peer}");
     Channel::with(stream, |ch| {
-        let (k_n_tx, iv_tx, k_n_rx, iv_rx) = read_setup_frame(ch, &peer)?;
+        let (_ecdh_share, k_n_tx, iv_tx, k_n_rx, iv_rx) = read_setup_frame(ch, &peer)?;
         eprintln!("notary_proxy: setup complete from {peer}, running attested worker");
         match run_notary_worker_attested(ch, &signing_key, k_n_tx, iv_tx, k_n_rx, iv_rx)? {
             Some(bundle) => eprintln!(

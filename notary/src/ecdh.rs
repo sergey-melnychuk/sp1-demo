@@ -36,15 +36,41 @@ pub struct X25519SharedSecret(pub [u8; 32]);
 
 /// Notary (or client) generates its additive share of the client ephemeral key.
 pub fn generate_share<R: RngCore>(rng: &mut R) -> EphemeralShare {
+    EphemeralShare {
+        scalar: Scalar::from_bytes_mod_order(clamp_scalar_bytes(random_scalar_bytes(rng))),
+    }
+}
+
+/// Random 32-byte scalar limbs before X25519 clamping.
+pub fn random_scalar_bytes<R: RngCore>(rng: &mut R) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     rng.fill_bytes(&mut bytes);
-    // Clamp like X25519
-    bytes[0] &= 248;
-    bytes[31] &= 127;
-    bytes[31] |= 64;
+    bytes
+}
+
+/// RFC 7748 clamp for X25519 scalars.
+pub fn clamp_scalar_bytes(bytes: [u8; 32]) -> [u8; 32] {
+    let mut out = bytes;
+    out[0] &= 248;
+    out[31] &= 127;
+    out[31] |= 64;
+    out
+}
+
+/// Decode a clamped scalar share from the wire (mode-1 pre-TLS).
+pub fn share_from_bytes(bytes: &[u8; 32]) -> EphemeralShare {
     EphemeralShare {
-        scalar: Scalar::from_bytes_mod_order(bytes),
+        scalar: Scalar::from_bytes_mod_order(clamp_scalar_bytes(*bytes)),
     }
+}
+
+pub fn share_to_bytes(share: &EphemeralShare) -> [u8; 32] {
+    clamp_scalar_bytes(share.scalar.to_bytes())
+}
+
+/// Combined client ephemeral for TLS `ExternalKxGroup`: `(s_host + s_notary) mod L`, clamped.
+pub fn combined_client_esk(host: &EphemeralShare, notary: &EphemeralShare) -> [u8; 32] {
+    clamp_scalar_bytes((host.scalar + notary.scalar).to_bytes())
 }
 
 /// This party's partial point: `share * server_epk` (Edwards).
@@ -97,13 +123,29 @@ pub trait EcdhIkmDriver: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// OT / MtA Curve25519 2PC — unimplemented (`TODO.md` #1).
+/// OT / MtA Curve25519 2PC — full OT-MtA scalar mult still TODO (`TODO.md` #1).
+///
+/// [`OtX25519Blinded`] implements a **semi-honest blinded point-addition** step:
+/// partial points never traverse the wire in the clear; the host receives only an
+/// XOR share of the 32-byte IKM. The notary (trusted in this demo) reconstructs
+/// the full IKM locally to verify / log. This is **not** malicious security and
+/// does **not** remove rustls's transient full-key window by itself.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OtX25519Blinded;
+
+impl EcdhIkmDriver for OtX25519Blinded {
+    fn name(&self) -> &'static str {
+        "OtX25519Blinded (blinded point-add; host gets XOR IKM share only)"
+    }
+}
+
+/// Deprecated alias — use [`OtX25519Blinded`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OtX25519Placeholder;
 
 impl EcdhIkmDriver for OtX25519Placeholder {
     fn name(&self) -> &'static str {
-        "OtX25519Placeholder (unimplemented — see TODO.md #1)"
+        OtX25519Blinded.name()
     }
 }
 
@@ -246,6 +288,138 @@ pub fn notary_recv_ecdh_leaky<R: Read + Write>(
 /// Host skips the leaky ECDH round (single flag byte after IVs).
 pub fn host_skip_ecdh_leaky<W: Write>(io: &mut W) -> std::io::Result<()> {
     io.write_all(&[SETUP_ECDH_SKIP])
+}
+
+// ── OT-blinded point addition (no cleartext partials on wire) ────────────────
+
+/// Host-side outcome: XOR share only — **no** full IKM field.
+#[derive(Debug, Clone, Copy)]
+pub struct OtEcdhHostOutcome {
+    pub host_ikm_share: [u8; 32],
+}
+
+/// Notary-side outcome (trusted party may hold full IKM for demo verification).
+#[derive(Debug, Clone, Copy)]
+pub struct OtEcdhNotaryOutcome {
+    pub host_ikm_share: [u8; 32],
+    pub notary_ikm_share: [u8; 32],
+    pub ikm: X25519SharedSecret,
+}
+
+/// Host sends this after IVs; blinded OT-style ECDH (default in mode 1).
+pub const SETUP_ECDH_OT: u8 = 2;
+
+/// Blinded addition protocol (semi-honest, notary-trusted):
+///
+/// 1. notary → host: `R` compressed Edwards (32 B), random `r·B` mask
+/// 2. host → notary: `Q = P_host + R` compressed (32 B)
+/// 3. notary → host: `host_ikm_share = u(P_host + P_notary) ⊕ notary_ikm_share`
+///
+/// Partial points `P_host`, `P_notary` never appear on the wire.
+pub fn host_run_ot_blinded<R: Read + Write>(
+    host_share: &EphemeralShare,
+    server_epk: &[u8; 32],
+    io: &mut R,
+) -> std::io::Result<OtEcdhHostOutcome> {
+    let p_host = compute_partial_point(host_share, server_epk);
+
+    let mut r_bytes = [0u8; WIRE_PARTIAL_LEN];
+    io.read_exact(&mut r_bytes)?;
+    let r_point = partial_from_bytes(&r_bytes)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad R"))?;
+
+    let q = p_host + r_point;
+    io.write_all(&partial_to_bytes(&q))?;
+
+    let mut host_ikm_share = [0u8; 32];
+    io.read_exact(&mut host_ikm_share)?;
+
+    Ok(OtEcdhHostOutcome { host_ikm_share })
+}
+
+/// Notary side of [`host_run_ot_blinded`].
+pub fn notary_run_ot_blinded<R: Read + Write>(
+    notary_share: &EphemeralShare,
+    server_epk: &[u8; 32],
+    io: &mut R,
+    rng: &mut impl RngCore,
+) -> std::io::Result<OtEcdhNotaryOutcome> {
+    let r_mask = generate_share(rng);
+    let r_point = compute_partial_point(&r_mask, server_epk);
+    io.write_all(&partial_to_bytes(&r_point))?;
+
+    let mut q_bytes = [0u8; WIRE_PARTIAL_LEN];
+    io.read_exact(&mut q_bytes)?;
+    let q = partial_from_bytes(&q_bytes)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad Q"))?;
+
+    let p_notary = compute_partial_point(notary_share, server_epk);
+    let sum = q + p_notary - r_point;
+    let ikm = X25519SharedSecret(sum.to_montgomery().0);
+
+    let mut notary_ikm_share = [0u8; 32];
+    rng.fill_bytes(&mut notary_ikm_share);
+    let host_ikm_share = std::array::from_fn(|i| ikm.0[i] ^ notary_ikm_share[i]);
+    io.write_all(&host_ikm_share)?;
+
+    Ok(OtEcdhNotaryOutcome {
+        host_ikm_share,
+        notary_ikm_share,
+        ikm,
+    })
+}
+
+pub fn host_send_ecdh_ot<R: Read + Write>(
+    io: &mut R,
+    host_share: &EphemeralShare,
+    server_epk: &[u8; 32],
+) -> std::io::Result<OtEcdhHostOutcome> {
+    io.write_all(&[SETUP_ECDH_OT])?;
+    io.write_all(server_epk)?;
+    host_run_ot_blinded(host_share, server_epk, io)
+}
+
+/// Unified post-IV ECDH flag dispatch (notary side).
+pub enum EcdhSetupOutcome {
+    Skipped,
+    Leaky(LeakyAdditiveOutcome),
+    Ot(OtEcdhNotaryOutcome),
+}
+
+pub fn notary_recv_ecdh_setup<R: Read + Write>(
+    io: &mut R,
+    notary_share: &EphemeralShare,
+    rng: &mut impl RngCore,
+) -> std::io::Result<EcdhSetupOutcome> {
+    let mut flag = [0u8; 1];
+    io.read_exact(&mut flag)?;
+    match flag[0] {
+        SETUP_ECDH_SKIP => Ok(EcdhSetupOutcome::Skipped),
+        SETUP_ECDH_LEAKY => {
+            let mut server_epk = [0u8; 32];
+            io.read_exact(&mut server_epk)?;
+            Ok(EcdhSetupOutcome::Leaky(notary_run_leaky_additive(
+                notary_share,
+                &server_epk,
+                io,
+                rng,
+            )?))
+        }
+        SETUP_ECDH_OT => {
+            let mut server_epk = [0u8; 32];
+            io.read_exact(&mut server_epk)?;
+            Ok(EcdhSetupOutcome::Ot(notary_run_ot_blinded(
+                notary_share,
+                &server_epk,
+                io,
+                rng,
+            )?))
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown SETUP_ECDH flag 0x{other:02x}"),
+        )),
+    }
 }
 
 /// Parse X25519 `key_share` (RFC 8446 §4.2.8) from the first inbound TLS handshake record payload.
@@ -443,6 +617,63 @@ mod tests {
         assert_eq!(host_out.notary_ikm_share, notary_out.notary_ikm_share);
         let recon: [u8; 32] =
             std::array::from_fn(|i| host_out.host_ikm_share[i] ^ host_out.notary_ikm_share[i]);
+        assert_eq!(recon, expect.0);
+    }
+
+    #[test]
+    fn ot_blinded_wire_roundtrip_over_pipes() {
+        use rand::rngs::OsRng;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let mut rng = OsRng;
+        let server_sk = StaticSecret::random_from_rng(&mut rng);
+        let server_epk = *PublicKey::from(&server_sk).as_bytes();
+
+        let k_c = generate_share(&mut rng);
+        let k_n = generate_share(&mut rng);
+
+        let (h2n_r, h2n_w) = std::io::pipe().unwrap();
+        let (n2h_r, n2h_w) = std::io::pipe().unwrap();
+
+        struct Duplex<R: Read, W: Write> {
+            r: R,
+            w: W,
+        }
+        impl<R: Read, W: Write> Read for Duplex<R, W> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.r.read(buf)
+            }
+        }
+        impl<R: Read, W: Write> Write for Duplex<R, W> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.w.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.w.flush()
+            }
+        }
+
+        let notary = std::thread::spawn(move || {
+            let mut io = Duplex {
+                r: n2h_r,
+                w: h2n_w,
+            };
+            notary_run_ot_blinded(&k_n, &server_epk, &mut io, &mut rng)
+        });
+
+        let mut host_io = Duplex {
+            r: h2n_r,
+            w: n2h_w,
+        };
+        let host_out = host_run_ot_blinded(&k_c, &server_epk, &mut host_io).unwrap();
+        let notary_out = notary.join().unwrap().unwrap();
+
+        let expect = reference_ikm(&k_c, &k_n, &server_epk);
+        assert_eq!(notary_out.ikm.0, expect.0);
+        assert_eq!(host_out.host_ikm_share, notary_out.host_ikm_share);
+        let recon: [u8; 32] = std::array::from_fn(|i| {
+            notary_out.host_ikm_share[i] ^ notary_out.notary_ikm_share[i]
+        });
         assert_eq!(recon, expect.0);
     }
 }
