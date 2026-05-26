@@ -509,16 +509,17 @@ fn parse_sh_key_share(body: &[u8]) -> Option<[u8; 32]> {
     None
 }
 
-/// Reference X25519 for test oracles: `X25519(host_share + notary_share, server_epk)`.
+/// Reference X25519 for test oracles: `X25519(clamp(s_host + s_notary), server_epk)`.
 pub fn reference_ikm(
     host_share: &EphemeralShare,
     notary_share: &EphemeralShare,
     server_epk: &[u8; 32],
 ) -> X25519SharedSecret {
-    let summed = host_share.scalar + notary_share.scalar;
+    let esk = combined_client_esk(host_share, notary_share);
+    let esk_scalar = Scalar::from_bytes_mod_order(esk);
     let mont = MontgomeryPoint(*server_epk);
     let server_ed = mont.to_edwards(0).expect("valid server epk");
-    X25519SharedSecret((&summed * server_ed).to_montgomery().0)
+    X25519SharedSecret((&esk_scalar * server_ed).to_montgomery().0)
 }
 
 #[cfg(test)]

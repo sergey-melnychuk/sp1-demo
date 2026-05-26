@@ -18,20 +18,20 @@
 //!   transcript-hash context: 54 bytes including the trailing `0x01`).
 //! - The HMAC *message* is assumed PUBLIC (encoded by the notary; client passes
 //!   matching bytes for assertion). This matches HKDF use in TLS 1.3 where the
-//!   `info` is a public label + context hash. HKDF-Extract's `IKM` is also
-//!   public in our current ecdh.rs (both parties learn the X25519 IKM).
+//!   `info` is a public label + context hash. **Exception:** [`notary_hmac_sha256_xor_msg`]
+//!   / [`client_hmac_sha256_xor_msg`] for a **32-byte XOR-shared IKM** (TODO.md #1).
 //! - The HMAC *key* is split between parties — this is what HKDF-Expand-Label
 //!   needs (the secret PRK is split).
 //!
-//! Out of scope here: secret-message HMAC (would require both parties to
-//! provide byte shares of `M`), HMAC for `msg.len() > 55` (would need a
-//! multi-block inner SHA chain).
+//! Out of scope here: HMAC for `msg.len() > 55` (would need a multi-block inner SHA chain).
+//! XOR-shared 32-byte messages (IKM) use [`notary_hmac_sha256_xor_msg`].
 
 use fancy_garbling::{
     Fancy, FancyBinary, WireMod2,
     circuit::{BinaryCircuit, CircuitExecutor},
 };
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use swanky_channel::Channel;
 use swanky_error::Result as SwankyResult;
 use swanky_ot_chou_orlandi::{Receiver as OtReceiver, Sender as OtSender};
@@ -361,6 +361,319 @@ pub fn client_hkdf_expand_label(
     client_hmac_sha256(channel, secret_c, &info)
 }
 
+// ── XOR-shared 32-byte HMAC message (secret IKM) ─────────────────────────────
+
+fn notary_xor_msg_block(notary_share: &[u8; 32]) -> [u8; 64] {
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(notary_share);
+    block[32] = 0x80;
+    let total_bits = (64 + 32) as u64 * 8;
+    block[56..64].copy_from_slice(&total_bits.to_be_bytes());
+    block
+}
+
+fn client_xor_msg_block(client_share: &[u8; 32]) -> [u8; 64] {
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(client_share);
+    block
+}
+
+/// Notary side of HMAC when the 32-byte message is XOR-shared (`msg = msg_n ⊕ msg_c`).
+pub fn notary_hmac_sha256_xor_msg(
+    channel: &mut Channel,
+    key_n: [u8; 32],
+    msg_n: [u8; 32],
+) -> SwankyResult<[u8; 32]> {
+    notary_hmac_sha256_xor_msg_inner(channel, key_n, msg_n)
+}
+
+fn notary_hmac_sha256_xor_msg_inner(
+    channel: &mut Channel,
+    key_n: [u8; 32],
+    msg_n: [u8; 32],
+) -> SwankyResult<[u8; 32]> {
+    let rng = SwankyRng::new();
+    let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
+    let circ = sha256_compress_circuit();
+
+    let mut k_ipad_n = [0u8; 64];
+    let mut k_opad_n = [0u8; 64];
+    for i in 0..32 {
+        k_ipad_n[i] = key_n[i] ^ IPAD;
+        k_opad_n[i] = key_n[i] ^ OPAD;
+    }
+    for i in 32..64 {
+        k_ipad_n[i] = IPAD;
+        k_opad_n[i] = OPAD;
+    }
+
+    let iv_wires = gb_split_bytes(&mut gb, channel, &SHA256_INITIAL_IV_BYTES)?;
+    let msg_wires = gb_split_bytes(&mut gb, channel, &k_ipad_n)?;
+    let mut inputs = iv_wires;
+    inputs.extend(msg_wires);
+    let h_inner_1 = circ.execute(&mut gb, &inputs, channel)?;
+
+    let notary_pad = notary_xor_msg_block(&msg_n);
+    let msg_wires = gb_split_bytes(&mut gb, channel, &notary_pad)?;
+    let mut inputs = h_inner_1.clone();
+    inputs.extend(msg_wires);
+    let h_inner_final = circ.execute(&mut gb, &inputs, channel)?;
+
+    let iv_wires = gb_split_bytes(&mut gb, channel, &SHA256_INITIAL_IV_BYTES)?;
+    let msg_wires = gb_split_bytes(&mut gb, channel, &k_opad_n)?;
+    let mut inputs = iv_wires;
+    inputs.extend(msg_wires);
+    let h_outer_1 = circ.execute(&mut gb, &inputs, channel)?;
+
+    let outer_suffix = outer_suffix_padding();
+    let suffix_wires = gb_split_bytes(&mut gb, channel, &outer_suffix)?;
+    let mut inputs = h_outer_1;
+    inputs.extend(h_inner_final);
+    inputs.extend(suffix_wires);
+    let hmac_wires = circ.execute(&mut gb, &inputs, channel)?;
+
+    let mut m_n_bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut m_n_bytes);
+    let mask_wires = gb.encode_many(
+        &bytes_to_bits(&m_n_bytes),
+        &vec![2u16; 256],
+        channel,
+    )?;
+    let masked = xor_wires(&mut gb, &hmac_wires, &mask_wires);
+    gb.outputs(&masked, channel)?;
+    Ok(m_n_bytes)
+}
+
+/// Client side of [`notary_hmac_sha256_xor_msg`].
+pub fn client_hmac_sha256_xor_msg(
+    channel: &mut Channel,
+    key_c: [u8; 32],
+    msg_c: [u8; 32],
+) -> SwankyResult<[u8; 32]> {
+    client_hmac_sha256_xor_msg_inner(channel, key_c, msg_c)
+}
+
+fn client_hmac_sha256_xor_msg_inner(
+    channel: &mut Channel,
+    key_c: [u8; 32],
+    msg_c: [u8; 32],
+) -> SwankyResult<[u8; 32]> {
+    let rng = SwankyRng::new();
+    let mut ev = Evaluator::<SwankyRng, OtReceiver, WireMod2>::new(channel, rng)?;
+    let circ = sha256_compress_circuit();
+
+    let mut k_ipad_c = [0u8; 64];
+    let mut k_opad_c = [0u8; 64];
+    for i in 0..32 {
+        k_ipad_c[i] = key_c[i];
+        k_opad_c[i] = key_c[i];
+    }
+
+    let iv_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
+    let msg_wires = ev_split_bytes(&mut ev, channel, &k_ipad_c)?;
+    let mut inputs = iv_wires;
+    inputs.extend(msg_wires);
+    let h_inner_1 = circ.execute(&mut ev, &inputs, channel)?;
+
+    let client_block = client_xor_msg_block(&msg_c);
+    let msg_wires = ev_split_bytes(&mut ev, channel, &client_block)?;
+    let mut inputs = h_inner_1.clone();
+    inputs.extend(msg_wires);
+    let h_inner_final = circ.execute(&mut ev, &inputs, channel)?;
+
+    let iv_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
+    let msg_wires = ev_split_bytes(&mut ev, channel, &k_opad_c)?;
+    let mut inputs = iv_wires;
+    inputs.extend(msg_wires);
+    let h_outer_1 = circ.execute(&mut ev, &inputs, channel)?;
+
+    let suffix_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
+    let mut inputs = h_outer_1;
+    inputs.extend(h_inner_final);
+    inputs.extend(suffix_wires);
+    let hmac_wires = circ.execute(&mut ev, &inputs, channel)?;
+
+    let mask_wires = ev.receive_many(&vec![2u16; 256], channel)?;
+    let masked = xor_wires(&mut ev, &hmac_wires, &mask_wires);
+    let vals = ev
+        .outputs(&masked, channel)?
+        .expect("evaluator always receives output");
+    Ok(bits_to_bytes_32(&vals))
+}
+
+/// HKDF-Extract with XOR-shared 32-byte IKM (neither party holds full IKM).
+pub fn notary_hkdf_extract_xor_ikm(
+    channel: &mut Channel,
+    salt_n: [u8; 32],
+    ikm_n: [u8; 32],
+) -> SwankyResult<[u8; 32]> {
+    notary_hmac_sha256_xor_msg(channel, salt_n, ikm_n)
+}
+
+pub fn client_hkdf_extract_xor_ikm(
+    channel: &mut Channel,
+    salt_c: [u8; 32],
+    ikm_c: [u8; 32],
+) -> SwankyResult<[u8; 32]> {
+    client_hmac_sha256_xor_msg(channel, salt_c, ikm_c)
+}
+
+// ── Reference TLS 1.3 key schedule (single-party oracle) ─────────────────────
+
+pub fn reference_empty_hash() -> [u8; 32] {
+    Sha256::digest([]).into()
+}
+
+pub fn reference_hkdf_extract(salt: &[u8; 32], ikm: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC key");
+    mac.update(ikm);
+    mac.finalize().into_bytes().into()
+}
+
+pub fn reference_hkdf_expand_label(prk: &[u8; 32], label: &str, context: &[u8], len: u16) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let info = hkdf_expand_label_info(label, context, len);
+    let mut mac = Hmac::<Sha256>::new_from_slice(prk).expect("HMAC key");
+    mac.update(&info);
+    mac.finalize().into_bytes().into()
+}
+
+/// Client traffic keys/IVs from full IKM + TLS 1.3 transcript hashes (RFC 8446 §7).
+pub fn reference_tls13_client_traffic(
+    ikm: &[u8; 32],
+    transcript_after_sh: &[u8; 32],
+    transcript_after_sf: &[u8; 32],
+) -> ([u8; 16], [u8; 12], [u8; 16], [u8; 12]) {
+    let empty = reference_empty_hash();
+    let early = reference_hkdf_extract(&[0u8; 32], &[0u8; 32]);
+    let derived1 = reference_hkdf_expand_label(&early, "derived", &empty, 32);
+    let hs = reference_hkdf_extract(&derived1, ikm);
+    let _client_hs = reference_hkdf_expand_label(&hs, "c hs traffic", transcript_after_sh, 32);
+    let derived2 = reference_hkdf_expand_label(&hs, "derived", &empty, 32);
+    let master = reference_hkdf_extract(&derived2, &[0u8; 32]);
+    let client_app = reference_hkdf_expand_label(&master, "c ap traffic", transcript_after_sf, 32);
+    let server_app = reference_hkdf_expand_label(&master, "s ap traffic", transcript_after_sf, 32);
+    let mut tx_key = [0u8; 16];
+    let mut tx_iv = [0u8; 12];
+    let mut rx_key = [0u8; 16];
+    let mut rx_iv = [0u8; 12];
+    tx_key.copy_from_slice(&reference_hkdf_expand_label(&client_app, "key", &[], 16)[..16]);
+    tx_iv.copy_from_slice(&reference_hkdf_expand_label(&client_app, "iv", &[], 12)[..12]);
+    rx_key.copy_from_slice(&reference_hkdf_expand_label(&server_app, "key", &[], 16)[..16]);
+    rx_iv.copy_from_slice(&reference_hkdf_expand_label(&server_app, "iv", &[], 12)[..12]);
+    (tx_key, tx_iv, rx_key, rx_iv)
+}
+
+/// XOR shares of client write/read traffic keys + public IVs from XOR-shared IKM.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientTrafficShares {
+    pub k_c_tx: [u8; 16],
+    pub k_c_rx: [u8; 16],
+    pub iv_tx: [u8; 12],
+    pub iv_rx: [u8; 12],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NotaryTrafficShares {
+    pub k_n_tx: [u8; 16],
+    pub k_n_rx: [u8; 16],
+    pub iv_tx: [u8; 12],
+    pub iv_rx: [u8; 12],
+}
+
+pub fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    std::array::from_fn(|i| a[i] ^ b[i])
+}
+
+pub fn xor16(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    std::array::from_fn(|i| a[i] ^ b[i])
+}
+
+pub fn notary_tls13_client_traffic_from_ikm_shares(
+    channel: &mut Channel,
+    ikm_n: [u8; 32],
+    transcript_after_sh: [u8; 32],
+    transcript_after_sf: [u8; 32],
+) -> SwankyResult<NotaryTrafficShares> {
+    let empty = reference_empty_hash();
+    let early = reference_hkdf_extract(&[0u8; 32], &[0u8; 32]);
+    let derived1 = reference_hkdf_expand_label(&early, "derived", &empty, 32);
+
+    let hs_n = notary_hkdf_extract_xor_ikm(channel, derived1, ikm_n)?;
+    let _client_hs_n = notary_hkdf_expand_label(channel, hs_n, "c hs traffic", &transcript_after_sh, 32)?;
+    let derived2_n = notary_hkdf_expand_label(channel, hs_n, "derived", &empty, 32)?;
+    let master_n = notary_hkdf_extract(channel, derived2_n, 32)?;
+    let client_app_n =
+        notary_hkdf_expand_label(channel, master_n, "c ap traffic", &transcript_after_sf, 32)?;
+    let server_app_n =
+        notary_hkdf_expand_label(channel, master_n, "s ap traffic", &transcript_after_sf, 32)?;
+
+    let mut k_n_tx = [0u8; 16];
+    let mut k_n_rx = [0u8; 16];
+    let tx_full = notary_hkdf_expand_label(channel, client_app_n, "key", &[], 16)?;
+    let rx_full = notary_hkdf_expand_label(channel, server_app_n, "key", &[], 16)?;
+    k_n_tx.copy_from_slice(&tx_full[..16]);
+    k_n_rx.copy_from_slice(&rx_full[..16]);
+
+    let iv_tx_share = notary_hkdf_expand_label(channel, client_app_n, "iv", &[], 12)?;
+    let iv_rx_share = notary_hkdf_expand_label(channel, server_app_n, "iv", &[], 12)?;
+    let mut iv_tx = [0u8; 12];
+    let mut iv_rx = [0u8; 12];
+    iv_tx.copy_from_slice(&iv_tx_share[..12]);
+    iv_rx.copy_from_slice(&iv_rx_share[..12]);
+
+    Ok(NotaryTrafficShares {
+        k_n_tx,
+        k_n_rx,
+        iv_tx,
+        iv_rx,
+    })
+}
+
+/// Host side of [`notary_tls13_client_traffic_from_ikm_shares`].
+pub fn client_tls13_client_traffic_from_ikm_shares(
+    channel: &mut Channel,
+    ikm_c: [u8; 32],
+    transcript_after_sh: [u8; 32],
+    transcript_after_sf: [u8; 32],
+) -> SwankyResult<ClientTrafficShares> {
+    let empty = reference_empty_hash();
+    let early = reference_hkdf_extract(&[0u8; 32], &[0u8; 32]);
+    let _derived1 = reference_hkdf_expand_label(&early, "derived", &empty, 32);
+
+    let hs_c = client_hkdf_extract_xor_ikm(channel, [0u8; 32], ikm_c)?;
+    let _client_hs_c =
+        client_hkdf_expand_label(channel, hs_c, "c hs traffic", &transcript_after_sh, 32)?;
+    let derived2_c = client_hkdf_expand_label(channel, hs_c, "derived", &empty, 32)?;
+    let master_c = client_hkdf_extract(channel, derived2_c, &[0u8; 32])?;
+    let client_app_c =
+        client_hkdf_expand_label(channel, master_c, "c ap traffic", &transcript_after_sf, 32)?;
+    let server_app_c =
+        client_hkdf_expand_label(channel, master_c, "s ap traffic", &transcript_after_sf, 32)?;
+
+    let mut k_c_tx = [0u8; 16];
+    let mut k_c_rx = [0u8; 16];
+    let tx_full = client_hkdf_expand_label(channel, client_app_c, "key", &[], 16)?;
+    let rx_full = client_hkdf_expand_label(channel, server_app_c, "key", &[], 16)?;
+    k_c_tx.copy_from_slice(&tx_full[..16]);
+    k_c_rx.copy_from_slice(&rx_full[..16]);
+
+    let iv_tx_share = client_hkdf_expand_label(channel, client_app_c, "iv", &[], 12)?;
+    let iv_rx_share = client_hkdf_expand_label(channel, server_app_c, "iv", &[], 12)?;
+    let mut iv_tx = [0u8; 12];
+    let mut iv_rx = [0u8; 12];
+    iv_tx.copy_from_slice(&iv_tx_share[..12]);
+    iv_rx.copy_from_slice(&iv_rx_share[..12]);
+
+    Ok(ClientTrafficShares {
+        k_c_tx,
+        k_c_rx,
+        iv_tx,
+        iv_rx,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -485,5 +798,78 @@ mod tests {
         .unwrap();
 
         assert_eq!(xor32(n_share, c_share), expected);
+    }
+
+    #[test]
+    fn hmac_sha256_xor_msg_matches_reference() {
+        let k_n = [0x11u8; 32];
+        let k_c = [0x22u8; 32];
+        let k = xor32(k_n, k_c);
+        let msg_n = [0x33u8; 32];
+        let msg_c = [0x44u8; 32];
+        let msg: [u8; 32] = xor32(msg_n, msg_c);
+
+        let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+        mac.update(&msg);
+        let expected: [u8; 32] = mac.finalize().into_bytes().into();
+
+        let (n_share, c_share) = local_channel_pair(
+            |ch| notary_hmac_sha256_xor_msg(ch, k_n, msg_n),
+            |ch| client_hmac_sha256_xor_msg(ch, k_c, msg_c),
+        )
+        .unwrap();
+
+        assert_eq!(xor32(n_share, c_share), expected);
+    }
+
+    #[test]
+    fn tls13_traffic_2pc_matches_reference() {
+        let ikm: [u8; 32] = [0x5au8; 32];
+        let ikm_n = [0xa1u8; 32];
+        let ikm_c = xor32(ikm_n, ikm);
+        let after_sh = [0x01u8; 32];
+        let after_sf = [0x02u8; 32];
+
+        let (tx, iv_tx, rx, iv_rx) = reference_tls13_client_traffic(&ikm, &after_sh, &after_sf);
+
+        let (n_shares, c_shares) = local_channel_pair(
+            |ch| {
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+            },
+            |ch| {
+                client_tls13_client_traffic_from_ikm_shares(ch, ikm_c, after_sh, after_sf)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), tx);
+        assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), rx);
+        assert_eq!(xor32(
+            {
+                let mut a = [0u8; 32];
+                a[..12].copy_from_slice(&n_shares.iv_tx);
+                a
+            },
+            {
+                let mut b = [0u8; 32];
+                b[..12].copy_from_slice(&c_shares.iv_tx);
+                b
+            },
+        )[..12], iv_tx);
+        assert_eq!(
+            xor32(
+                {
+                    let mut a = [0u8; 32];
+                    a[..12].copy_from_slice(&n_shares.iv_rx);
+                    a
+                },
+                {
+                    let mut b = [0u8; 32];
+                    b[..12].copy_from_slice(&c_shares.iv_rx);
+                    b
+                },
+            )[..12],
+            iv_rx
+        );
     }
 }

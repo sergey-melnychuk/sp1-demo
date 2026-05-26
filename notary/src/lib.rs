@@ -10,9 +10,11 @@ pub mod aes;
 pub mod ecdh;
 pub mod hkdf;
 pub mod tls;
+pub mod transcript;
 
 // Re-export the public surface so existing code continues to work
 pub use aes::*;
 pub use ecdh::*;
 pub use hkdf::*;
 pub use tls::*;
+pub use transcript::*;

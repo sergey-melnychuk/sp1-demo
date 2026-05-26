@@ -16,10 +16,10 @@ the server has no idea anything unusual happened.
 > (`TODO.md` #1 MtA; default is [`OtX25519Blinded`](notary/src/ecdh.rs) — see [`ECDH.md` § Protocol](ECDH.md#protocol)).
 >
 > **Notary vs host XOR-mask role (default demo):** `notary_proxy` reads a **mode byte**.
-//!   3. We split each AES traffic key: `K_C = K_full XOR K_N`, **zero the full key**
-//!      from host memory. **Default:** notary sends XOR masks + scalar share before TLS;
-//!      ClientHello uses split ephemeral; post-IV **OT-blinded ECDH** gives host an XOR
-//!      IKM share only (`--leaky-ecdh-wire` for debug cleartext partials).
+> //! 3. We split each AES traffic key: `K_C = K_full XOR K_N`, **zero the full key**
+> //! from host memory. **Default:** notary sends XOR masks + scalar share before TLS;
+> //! ClientHello uses split ephemeral; post-IV **OT-blinded ECDH** gives host an XOR
+> //! IKM share only (`--leaky-ecdh-wire` for debug cleartext partials).
 > `--legacy-host-xor-masks` — original single 56-byte host→notary setup (masks + IVs after handshake).
 
 ## Quick start
@@ -96,19 +96,19 @@ HTTP/1.1 200 OK
    └──────────────────────────────────────────────────┘     │  │
                                                             │  │
                                                             ▼  ▼
-                                  ┌──────────────────────────────────┐
-                                  │ notary_proxy (daemon)            │
-                                  │  ───────────────                 │
-                                  │  - reads mode byte + setup frames│
-                                  │  - run_notary_worker:            │
-                                  │    loop on (op, seq, aad, len):  │
-                                  │      OP_ENCRYPT  → notary_       │
-                                  │                    encrypt_gcm   │
-                                  │                    (K_N_tx,IV_tx)│
-                                  │      OP_DECRYPT  → notary_       │
-                                  │                    decrypt_gcm   │
-                                  │                    (K_N_rx,IV_rx)│
-                                  └──────────────────────────────────┘
+                                  ┌───────────────────────────────────┐
+                                  │ notary_proxy (daemon)             │
+                                  │  ───────────────                  │
+                                  │  - reads mode byte + setup frames │
+                                  │  - run_notary_worker:             │
+                                  │    loop on (op, seq, aad, len):   │
+                                  │      OP_ENCRYPT  → notary_        │
+                                  │                    encrypt_gcm    │
+                                  │                    (K_N_tx,IV_tx) │
+                                  │      OP_DECRYPT  → notary_        │
+                                  │                    decrypt_gcm    │
+                                  │                    (K_N_rx,IV_rx) │
+                                  └───────────────────────────────────┘
 ```
 
 ## What happens, phase by phase

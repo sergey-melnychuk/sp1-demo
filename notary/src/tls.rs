@@ -167,6 +167,7 @@ impl NotaryTlsSession {
 const OP_ENCRYPT: u8 = 0x01;
 const OP_DECRYPT: u8 = 0x02;
 const OP_FINISH: u8 = 0x03;
+const OP_2PC_HKDF: u8 = 0x04;
 
 struct Header {
     op: u8,
@@ -202,6 +203,71 @@ fn read_header(ch: &mut Channel) -> SwankyResult<Header> {
     ch.read_bytes(&mut pl_buf)?;
     let payload_len = u32::from_be_bytes(pl_buf);
     Ok(Header { op: op[0], seq, aad, payload_len })
+}
+
+/// Pending 2PC TLS 1.3 traffic-key derivation (notary holds full IKM for public IV oracle).
+pub struct TwoPcTrafficSetup {
+    pub ikm_n: [u8; 32],
+    pub after_sh: [u8; 32],
+    pub after_sf: [u8; 32],
+    pub ikm_full: [u8; 32],
+}
+
+/// Host: announce 2PC HKDF then derive client traffic key shares.
+pub fn client_run_2pc_traffic_hkdf(
+    channel: &mut Channel,
+    ikm_c: [u8; 32],
+    after_sh: [u8; 32],
+    after_sf: [u8; 32],
+) -> SwankyResult<crate::hkdf::ClientTrafficShares> {
+    write_header(
+        channel,
+        &Header {
+            op: OP_2PC_HKDF,
+            seq: 0,
+            aad: Vec::new(),
+            payload_len: 0,
+        },
+    )?;
+    crate::hkdf::client_tls13_client_traffic_from_ikm_shares(
+        channel, ikm_c, after_sh, after_sf,
+    )
+}
+
+/// Notary: wait for [`OP_2PC_HKDF`], derive traffic keys, then run the attested worker.
+pub fn run_notary_worker_attested_2pc(
+    channel: &mut Channel,
+    signing_key: &SigningKey,
+    setup: TwoPcTrafficSetup,
+) -> SwankyResult<Option<NotaryBundle>> {
+    let header = read_header(channel)?;
+    if header.op != OP_2PC_HKDF {
+        swanky_error::bail!(
+            swanky_error::ErrorKind::OtherError,
+            "expected OP_2PC_HKDF (0x{:02x}), got 0x{:02x}",
+            OP_2PC_HKDF,
+            header.op
+        );
+    }
+    let traffic = crate::hkdf::notary_tls13_client_traffic_from_ikm_shares(
+        channel,
+        setup.ikm_n,
+        setup.after_sh,
+        setup.after_sf,
+    )?;
+    let (_, iv_tx, _, iv_rx) = crate::hkdf::reference_tls13_client_traffic(
+        &setup.ikm_full,
+        &setup.after_sh,
+        &setup.after_sf,
+    );
+    run_notary_worker_inner(
+        channel,
+        Some(signing_key),
+        traffic.k_n_tx,
+        iv_tx,
+        traffic.k_n_rx,
+        iv_rx,
+    )
 }
 
 /// Drive the notary side of 2PC AES-GCM. See [`run_notary_worker_attested`]
