@@ -1,9 +1,14 @@
 //! Notary proxy daemon.
 //!
-//! Listens on a TCP port. For each connection:
-//!   1. Reads a 56-byte setup frame from the swanky channel:
-//!        K_N_tx (16) || IV_tx (12) || K_N_rx (16) || IV_rx (12)
-//!   2. Runs [`notary::tls::run_notary_worker_attested`] until the prover sends
+//! Listens on a TCP port. For each connection the prover first sends a **setup mode** byte:
+//!
+//! - **`0` — legacy:** prover sends **`K_N_tx (16) || IV_tx (12) || K_N_rx (16) || IV_rx (12)`**
+//!   (56 bytes). Same as the original demo (host chose random XOR masks).
+//! - **`1` — notary-chosen XOR masks:** notary samples `K_N_tx || K_N_rx` (32 bytes) and sends them
+//!   to the prover *before* TLS traffic keys exist on the wire; after the prover finishes the TLS
+//!   handshake it sends **`IV_tx (12) || IV_rx (12)`** (24 bytes). IVs are public in TLS 1.3.
+//!
+//! Then runs [`notary::tls::run_notary_worker_attested`] until the prover sends
 //!      OP_FINISH (in which case the notary signs and returns the bundle) or
 //!      the peer disconnects.
 //!
@@ -66,20 +71,74 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+
+/// Setup mode byte from prover (`notary_demo`).
+const SETUP_LEGACY_HOST_MASKS: u8 = 0;
+const SETUP_NOTARY_CHOOSES_XOR_MASKS: u8 = 1;
+
+fn read_setup_frame(
+    ch: &mut Channel,
+    peer: &str,
+) -> swanky_error::Result<([u8; 16], [u8; 12], [u8; 16], [u8; 12])> {
+    let mut mode = [0u8; 1];
+    ch.read_bytes(&mut mode)?;
+    match mode[0] {
+        SETUP_LEGACY_HOST_MASKS => {
+            let mut frame = [0u8; 56];
+            ch.read_bytes(&mut frame)?;
+            let mut k_n_tx = [0u8; 16];
+            let mut iv_tx = [0u8; 12];
+            let mut k_n_rx = [0u8; 16];
+            let mut iv_rx = [0u8; 12];
+            k_n_tx.copy_from_slice(&frame[..16]);
+            iv_tx.copy_from_slice(&frame[16..28]);
+            k_n_rx.copy_from_slice(&frame[28..44]);
+            iv_rx.copy_from_slice(&frame[44..56]);
+            eprintln!(
+                "notary_proxy: setup LEGACY host-chosen XOR masks received from {peer}"
+            );
+            Ok((k_n_tx, iv_tx, k_n_rx, iv_rx))
+        }
+        SETUP_NOTARY_CHOOSES_XOR_MASKS => {
+            let mut k_n_tx = [0u8; 16];
+            let mut k_n_rx = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut k_n_tx);
+            rand::thread_rng().fill_bytes(&mut k_n_rx);
+            let mut kn = [0u8; 32];
+            kn[..16].copy_from_slice(&k_n_tx);
+            kn[16..].copy_from_slice(&k_n_rx);
+            ch.write_bytes(&kn)?;
+            ch.force_flush().map_err(|e| {
+                swanky_error::swanky_error!(
+                    swanky_error::ErrorKind::NetworkError,
+                    "flush K_N after notary-chosen masks: {e}"
+                )
+            })?;
+            eprintln!(
+                "notary_proxy: pushed notary-chosen XOR masks ({peer}), waiting for IVs"
+            );
+            let mut iv_tx = [0u8; 12];
+            let mut iv_rx = [0u8; 12];
+            ch.read_bytes(&mut iv_tx)?;
+            ch.read_bytes(&mut iv_rx)?;
+            eprintln!("notary_proxy: IVs received from {peer}");
+            Ok((k_n_tx, iv_tx, k_n_rx, iv_rx))
+        }
+        other => swanky_error::bail!(
+            swanky_error::ErrorKind::OtherError,
+            "unknown setup mode 0x{:02x} from {peer}",
+            other
+        ),
+    }
+}
+
 fn handle(stream: TcpStream, signing_key: Arc<SigningKey>) -> swanky_error::Result<()> {
     let peer =
         stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<?>".into());
     eprintln!("notary_proxy: connection from {peer}");
     Channel::with(stream, |ch| {
-        let mut k_n_tx = [0u8; 16];
-        let mut iv_tx = [0u8; 12];
-        let mut k_n_rx = [0u8; 16];
-        let mut iv_rx = [0u8; 12];
-        ch.read_bytes(&mut k_n_tx)?;
-        ch.read_bytes(&mut iv_tx)?;
-        ch.read_bytes(&mut k_n_rx)?;
-        ch.read_bytes(&mut iv_rx)?;
-        eprintln!("notary_proxy: setup received from {peer}, running attested worker");
+        let (k_n_tx, iv_tx, k_n_rx, iv_rx) = read_setup_frame(ch, &peer)?;
+        eprintln!("notary_proxy: setup complete from {peer}, running attested worker");
         match run_notary_worker_attested(ch, &signing_key, k_n_tx, iv_tx, k_n_rx, iv_rx)? {
             Some(bundle) => eprintln!(
                 "notary_proxy: signed bundle for {peer} — session_id={:?} server={:?} records={}",

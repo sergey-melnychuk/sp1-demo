@@ -3,7 +3,7 @@
 //! This is the entry point the `host` crate uses when acting as the
 //! prover/notary pair during a zkTLS session. It composes:
 //!
-//! - [`ecdh`]: 3-party additive X25519 — `client_priv = K_C + K_N` (mod L).
+//! - [`ecdh`]: X25519 additives + XOR-split IKM helpers + `OtX25519Placeholder`.
 //! - [`hkdf`]: 2PC HKDF-SHA256 — yields each party's share of the AES traffic
 //!   key (`K = K_N XOR K_C`) without either party seeing the full key.
 //! - [`aes`]: split-key AES-128-GCM (encrypt + decrypt) over a swanky channel.

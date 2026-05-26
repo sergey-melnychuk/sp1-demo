@@ -10,11 +10,15 @@ split-key 2PC AES-GCM (garbled circuits over swanky). The ciphertext that
 hits the wire is byte-identical to what a normal TLS client would produce —
 the server has no idea anything unusual happened.
 
-> **Caveat:** the handshake itself currently runs through stock rustls + ring
-> AEAD, so the host *briefly* holds the full key between handshake completion
-> and the `zeroize()` that follows the key split. Closing that gap requires
-> 2PC of the Curve25519 ECDH itself — see `TODO.md` item #1. Everything
-> *after* the split is genuinely split-key.
+> **Caveat:** the handshake still runs through stock rustls + ring AEAD, so the host
+> *briefly* holds the full AES traffic keys between `dangerous_extract_secrets()`
+> and `zeroize()`. Closing that gap needs **real 2PC X25519 / key schedule**
+> (`TODO.md` #1, `OtX25519Placeholder` in [`notary/src/ecdh.rs`](notary/src/ecdh.rs)).
+>
+> **Notary vs host XOR-mask role (default demo):** `notary_proxy` reads a **mode byte**.
+> Mode **`1`** (default for `notary_demo`): notary sends random `K_N_tx||K_N_rx` **before**
+> the HTTPS TLS handshake finishes; host XOR-splits after extract and uploads IVs. Mode **`0`**:
+> `--legacy-host-xor-masks` — original single 56-byte host→notary setup (masks + IVs after handshake).
 
 ## Quick start
 
@@ -40,9 +44,11 @@ performance work that would bring this down to seconds.
 ## Sample output
 
 ```
+phase 0a: connect notary for notary-chosen XOR masks ...
+phase 0a: XOR mask halves received ...
 phase 1: TCP+TLS handshake to jsonplaceholder.typicode.com:443
 phase 2: traffic secrets extracted (tx_seq=0, rx_seq=0)
-phase 3: connecting to notary at 127.0.0.1:9001
+phase 3: finalizing setup with notary at 127.0.0.1:9001
 phase 4: encrypting 93 bytes of HTTP request via 2PC AES-GCM
 phase 4: request record sent
 phase 5: reading response records
@@ -69,11 +75,12 @@ HTTP/1.1 200 OK
    ┌──────────────────────────────────────────────────┐
    │ notary_demo (host)                               │
    │  ──────────────────────                          │
+   │  0a. (default) TCP to notary: recv K_N_tx||K_N_rx│
    │  1. rustls handshake (ring AEAD)                 │
    │  2. dangerous_extract_secrets() → K_tx, K_rx     │
-   │  3. K_N_* = random; K_C_* = K_* XOR K_N_*        │
-   │     zeroize(K_tx); zeroize(K_rx)                 │
-   │  4. send (K_N_tx, IV_tx, K_N_rx, IV_rx) ────────────────┐
+   │  3. K_C_* = K_* XOR K_N_* ; zeroize(K_*)          │
+   │  4. send IV_tx||IV_rx to notary (mode 1)         │
+   │     or legacy: mode 0 — one 56 B frame ──────────┤
    │     for each request record:                            │
    │       2PC-encrypt (host: K_C_tx) ──────────────────────────┐
    │       send TLS record to server                         │  │
@@ -86,7 +93,7 @@ HTTP/1.1 200 OK
                                   ┌─────────────────────────────────┐
                                   │ notary_proxy (daemon)           │
                                   │  ───────────────                │
-                                  │  - reads 56-byte setup frame    │
+                                  │  - reads mode byte + setup frames│
                                   │  - run_notary_worker:           │
                                   │    loop on (op, seq, aad, len): │
                                   │      OP_ENCRYPT  → notary_      │

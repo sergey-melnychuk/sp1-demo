@@ -6,9 +6,10 @@
 //!      handshake records are not 2PC'd, that's a deferred TODO).
 //!   2. `dangerous_extract_secrets()` pulls the application traffic keys out
 //!      of the connection.
-//!   3. We split each key (tx + rx) with the notary: pick random K_N, derive
-//!      K_C = key XOR K_N, send K_N + IV to the notary, **zero the full key
-//!      from our memory**.
+//!   3. We split each AES traffic key: `K_C = K_full XOR K_N`, **zero the full key**
+//!      from host memory. **Default:** `K_N` is chosen by the notary **before** TLS handshake
+//!      (`--legacy-host-xor-masks` restores host-chosen masks after handshake).
+//!      True 2PC X25519 (IKM never assembled on host) is still TODO.md #1.
 //!   4. From this point on, host has only K_C; notary has K_N; neither has K.
 //!   5. We take over the TcpStream manually: build the HTTP GET, encrypt it
 //!      as a TLS 1.3 record via 2PC AES-GCM, write to the socket. Read
@@ -16,7 +17,8 @@
 //!
 //! Trust caveats (all flagged in the codebase already):
 //!   - Handshake is local-only — the host briefly held K (between step 1 and
-//!     the split + zero in step 3). True "host never has K" requires ECDH 2PC.
+//!     the split + zero in step 3). True "host never has K" requires ECDH 2PC
+//!     (`notary::ecdh::OtX25519Placeholder` / workspace `TODO.md` #1).
 //!   - This demo is semi-honest; authenticated garbling not wired in.
 
 use std::io::{Read, Write};
@@ -34,6 +36,10 @@ use rustls::crypto::cipher::AeadKey;
 use rustls::{ClientConfig, ClientConnection};
 use swanky_channel::Channel;
 use zeroize::Zeroize;
+
+/// Setup framing (must stay in sync with `notary_proxy`).
+const SETUP_LEGACY_HOST_MASKS: u8 = 0;
+const SETUP_NOTARY_CHOOSES_XOR_MASKS: u8 = 1;
 
 #[derive(Parser, Debug)]
 #[command(about = "Demo: TLS 1.3 GET driven by split-key 2PC AES-GCM (record layer)")]
@@ -61,6 +67,14 @@ struct Args {
     /// Only used when `--witness-out` is set.
     #[arg(long, default_value_t = 0.0)]
     threshold: f64,
+
+    /// Original demo: host samples XOR masks **after** the handshake (single connection to notary).
+    ///
+    /// If **not** set (default), the **notary** sends `K_N_tx || K_N_rx` **before** TLS completes,
+    /// then receives IVs after secret extraction (`OtX25519Placeholder` reminds that true 2PC ECDH
+    /// is TODO.md #1 — rustls still sees full secrets briefly).
+    #[arg(long)]
+    legacy_host_xor_masks: bool,
 }
 
 fn xor_key(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
@@ -133,6 +147,33 @@ fn main() -> Result<()> {
     let server_name: rustls::pki_types::ServerName =
         host.clone().try_into().context("invalid server name")?;
 
+    // Notary XOR masks sampled by the notary *before* we finish TLS — ensures the notary’s share
+    // exists independently of rustls-derived keys (still does not implement OT-based ECDH).
+    let mut k_n_tx = [0u8; 16];
+    let mut k_n_rx = [0u8; 16];
+    let mut notary_pre_tls: Option<TcpStream> = None;
+
+    if !args.legacy_host_xor_masks {
+        eprintln!(
+            "phase 0a: connect notary for notary-chosen XOR masks {}",
+            args.notary
+        );
+        let mut nm = TcpStream::connect(&args.notary)
+            .with_context(|| format!("connect to notary {}", args.notary))?;
+        nm.set_nodelay(true)?;
+        nm.write_all(&[SETUP_NOTARY_CHOOSES_XOR_MASKS])
+            .context("write setup mode")?;
+        nm.flush().context("flush setup mode")?;
+        let mut kn = [0u8; 32];
+        nm.read_exact(&mut kn).context("read notary XOR mask frame")?;
+        k_n_tx.copy_from_slice(&kn[..16]);
+        k_n_rx.copy_from_slice(&kn[16..32]);
+        eprintln!(
+            "phase 0a: XOR mask halves received — 2PC AES path will use rustls-derived keys XOR these"
+        );
+        notary_pre_tls = Some(nm);
+    }
+
     eprintln!("phase 1: TCP+TLS handshake to {host}:{port}");
     let mut tcp = TcpStream::connect(format!("{host}:{port}"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
@@ -171,11 +212,11 @@ fn main() -> Result<()> {
         tx_seq, rx_seq
     );
 
-    // ── Phase 3: split each direction with the notary ─────────────────────
-    let mut k_n_tx = [0u8; 16];
-    let mut k_n_rx = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut k_n_tx);
-    rand::thread_rng().fill_bytes(&mut k_n_rx);
+    // ── Phase 3: XOR-split AES traffic keys ─────────────────────────────────
+    //
+    // K_full = K_C ⊕ K_N. After zeroize neither side holds both halves unless they collude.
+    // ECDH+Hkdf still ran inside rustls — OtX25519Placeholder / TODO.md #1 for true 2PC IKM.
+
     let k_c_tx = xor_key(&tx_key, &k_n_tx);
     let k_c_rx = xor_key(&rx_key, &k_n_rx);
     // After this point the host must never need the full keys again.
@@ -183,17 +224,31 @@ fn main() -> Result<()> {
     tx_key.zeroize();
     rx_key.zeroize();
 
-    eprintln!("phase 3: connecting to notary at {}", args.notary);
-    let mut notary_tcp = TcpStream::connect(&args.notary)
-        .with_context(|| format!("connect to notary {}", args.notary))?;
-    notary_tcp.set_nodelay(true)?;
+    eprintln!("phase 3: finalizing setup with notary at {}", args.notary);
+    let mut notary_tcp = if let Some(mut nm) = notary_pre_tls {
+        nm.write_all(&tx_iv).context("write IV_tx")?;
+        nm.write_all(&rx_iv).context("write IV_rx")?;
+        nm.flush().context("flush IVs")?;
+        nm
+    } else {
+        rand::thread_rng().fill_bytes(&mut k_n_tx);
+        rand::thread_rng().fill_bytes(&mut k_n_rx);
 
-    // Send setup frame to notary: K_N_tx || IV_tx || K_N_rx || IV_rx (56 bytes).
-    notary_tcp.write_all(&k_n_tx)?;
-    notary_tcp.write_all(&tx_iv)?;
-    notary_tcp.write_all(&k_n_rx)?;
-    notary_tcp.write_all(&rx_iv)?;
-    notary_tcp.flush()?;
+        let mut nm = TcpStream::connect(&args.notary)
+            .with_context(|| format!("connect to notary {}", args.notary))?;
+        nm.set_nodelay(true)?;
+        nm.write_all(&[SETUP_LEGACY_HOST_MASKS])
+            .context("write legacy setup mode")?;
+
+        let mut setup = [0u8; 56];
+        setup[..16].copy_from_slice(&k_n_tx);
+        setup[16..28].copy_from_slice(&tx_iv);
+        setup[28..44].copy_from_slice(&k_n_rx);
+        setup[44..56].copy_from_slice(&rx_iv);
+        nm.write_all(&setup).context("write legacy setup frame")?;
+        nm.flush().context("flush legacy setup")?;
+        nm
+    };
 
     // ── Phase 4: take over the record layer manually via 2PC ──────────────
     let http_request = format!(

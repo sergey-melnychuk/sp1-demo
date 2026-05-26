@@ -2,7 +2,7 @@
 //!
 //! Clean module structure:
 //! - `aes`   : split-key AES-GCM 2PC
-//! - `ecdh`  : 3-party additive X25519 (K_N + K_C)
+//! - `ecdh`  : X25519 additives / XOR-split IKM helpers + ECDH driver placeholder (`OtX25519Placeholder`)
 //! - `hkdf`  : 2PC HKDF-SHA256
 //! - `tls`   : high-level notary TLS session tooling (usable from host)
 
