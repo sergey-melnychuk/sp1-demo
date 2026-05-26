@@ -886,3 +886,49 @@ mod tests {
         assert!(!bad2.verify(), "tampered commit hash must not verify");
     }
 }
+
+// ── swanky Channel ↔ std::io (for ECDH post-setup framing) ───────────────────
+
+/// `Read` / `Write` adapter for a swanky [`Channel`] (exact-length reads/writes).
+pub struct ChannelRw<'ch, 'stream>(pub &'ch mut Channel<'stream>);
+
+impl Read for ChannelRw<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.0
+            .read_bytes(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+        Ok(buf.len())
+    }
+}
+
+impl Write for ChannelRw<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .write_bytes(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .force_flush()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+        Ok(())
+    }
+}
+
+/// After mode-1 IV setup: read host ECDH flag and optionally run leaky additive ECDH.
+pub fn notary_ecdh_after_setup_ivs(
+    ch: &mut Channel<'_>,
+    rng: &mut impl rand::RngCore,
+) -> SwankyResult<Option<crate::ecdh::LeakyAdditiveOutcome>> {
+    use crate::ecdh::{generate_share, notary_recv_ecdh_leaky};
+
+    let share = generate_share(rng);
+    let mut io = ChannelRw(ch);
+    notary_recv_ecdh_leaky(&mut io, &share, rng)
+        .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))
+}

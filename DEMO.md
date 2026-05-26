@@ -11,13 +11,15 @@ hits the wire is byte-identical to what a normal TLS client would produce —
 the server has no idea anything unusual happened.
 
 > **Caveat:** the handshake still runs through stock rustls + ring AEAD, so the host
-> *briefly* holds the full AES traffic keys between `dangerous_extract_secrets()`
+> _briefly_ holds the full AES traffic keys between `dangerous_extract_secrets()`
 > and `zeroize()`. Closing that gap needs **real 2PC X25519 / key schedule**
 > (`TODO.md` #1, `OtX25519Placeholder` in [`notary/src/ecdh.rs`](notary/src/ecdh.rs)).
 >
 > **Notary vs host XOR-mask role (default demo):** `notary_proxy` reads a **mode byte**.
 > Mode **`1`** (default for `notary_demo`): notary sends random `K_N_tx||K_N_rx` **before**
-> the HTTPS TLS handshake finishes; host XOR-splits after extract and uploads IVs. Mode **`0`**:
+> the HTTPS TLS handshake finishes; host XOR-splits after extract and uploads IVs, then runs a
+> **leaky additive ECDH** round (both sides log matching `IKM=` — plumbing only, see
+> [`notary/doc/PROTOCOL_ECDH.md`](notary/doc/PROTOCOL_ECDH.md)). Mode **`0`**:
 > `--legacy-host-xor-masks` — original single 56-byte host→notary setup (masks + IVs after handshake).
 
 ## Quick start
@@ -49,6 +51,8 @@ phase 0a: XOR mask halves received ...
 phase 1: TCP+TLS handshake to jsonplaceholder.typicode.com:443
 phase 2: traffic secrets extracted (tx_seq=0, rx_seq=0)
 phase 3: finalizing setup with notary at 127.0.0.1:9001
+phase 3b: leaky additive ECDH (server epk from ServerHello)
+phase 3b: host-side IKM=... (both parties learn full IKM — demo only)
 phase 4: encrypting 93 bytes of HTTP request via 2PC AES-GCM
 phase 4: request record sent
 phase 5: reading response records
@@ -78,31 +82,33 @@ HTTP/1.1 200 OK
    │  0a. (default) TCP to notary: recv K_N_tx||K_N_rx│
    │  1. rustls handshake (ring AEAD)                 │
    │  2. dangerous_extract_secrets() → K_tx, K_rx     │
-   │  3. K_C_* = K_* XOR K_N_* ; zeroize(K_*)          │
+   │  3. K_C_* = K_* XOR K_N_* ; zeroize(K_*)         │
    │  4. send IV_tx||IV_rx to notary (mode 1)         │
+   │  4b. leaky ECDH partial exchange (mode 1)        │
+   │     or `--skip-ecdh-wire` / legacy skips this    │
    │     or legacy: mode 0 — one 56 B frame ──────────┤
-   │     for each request record:                            │
-   │       2PC-encrypt (host: K_C_tx) ──────────────────────────┐
-   │       send TLS record to server                         │  │
-   │     for each response record:                           │  │
-   │       2PC-decrypt (host: K_C_rx) ──────────────────────────┤
-   │       strip inner-type, append plaintext                │  │
+   │     for each request record:                     │
+   │       2PC-encrypt (host: K_C_tx) ─────────────────────────┐
+   │       send TLS record to server                  |     │  │
+   │     for each response record:                    |     │  │
+   │       2PC-decrypt (host: K_C_rx) ─────────────────────────┤
+   │       strip inner-type, append plaintext         |     │  │
    └──────────────────────────────────────────────────┘     │  │
                                                             │  │
                                                             ▼  ▼
-                                  ┌─────────────────────────────────┐
-                                  │ notary_proxy (daemon)           │
-                                  │  ───────────────                │
+                                  ┌──────────────────────────────────┐
+                                  │ notary_proxy (daemon)            │
+                                  │  ───────────────                 │
                                   │  - reads mode byte + setup frames│
-                                  │  - run_notary_worker:           │
-                                  │    loop on (op, seq, aad, len): │
-                                  │      OP_ENCRYPT  → notary_      │
-                                  │                    encrypt_gcm  │
+                                  │  - run_notary_worker:            │
+                                  │    loop on (op, seq, aad, len):  │
+                                  │      OP_ENCRYPT  → notary_       │
+                                  │                    encrypt_gcm   │
                                   │                    (K_N_tx,IV_tx)│
-                                  │      OP_DECRYPT  → notary_      │
-                                  │                    decrypt_gcm  │
+                                  │      OP_DECRYPT  → notary_       │
+                                  │                    decrypt_gcm   │
                                   │                    (K_N_rx,IV_rx)│
-                                  └─────────────────────────────────┘
+                                  └──────────────────────────────────┘
 ```
 
 ## What happens, phase by phase
@@ -157,7 +163,7 @@ the whole session — multiple opens lose buffered bytes), the host calls
 function:
 
 1. Writes a small bridge header to the channel — `op=OP_ENCRYPT, seq, aad,
-   payload_len` — so the notary side knows what's coming.
+payload_len` — so the notary side knows what's coming.
 2. Runs `client_encrypt_gcm` (evaluator role), which performs the split-key
    2PC AES-GCM in lockstep with `notary_encrypt_gcm` on the other side.
 3. Returns `(ciphertext, tag)` — byte-identical to what
@@ -202,11 +208,11 @@ The setup frame sent once at connection start is just `K_N_tx ‖ IV_tx ‖
 K_N_rx ‖ IV_rx` (56 bytes). The notary reads it via the same swanky channel
 before entering the worker loop.
 
-## What's *not* in this demo
+## What's _not_ in this demo
 
 - **ECDH 2PC** (handshake key derivation under MPC) — host still briefly has `K`.
 - **Signed attestation** — the notary doesn't yet emit an Ed25519-signed bundle.
-- **Selective disclosure** — verifier with the keys sees the *whole* plaintext.
+- **Selective disclosure** — verifier with the keys sees the _whole_ plaintext.
 - **Authenticated garbling** — semi-honest 2PC only.
 - **Session tickets / key updates** — rustls' `dangerous_extract_secrets` is
   one-shot and doesn't track rekeying.

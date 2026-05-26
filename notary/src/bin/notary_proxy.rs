@@ -6,7 +6,8 @@
 //!   (56 bytes). Same as the original demo (host chose random XOR masks).
 //! - **`1` — notary-chosen XOR masks:** notary samples `K_N_tx || K_N_rx` (32 bytes) and sends them
 //!   to the prover *before* TLS traffic keys exist on the wire; after the prover finishes the TLS
-//!   handshake it sends **`IV_tx (12) || IV_rx (12)`** (24 bytes). IVs are public in TLS 1.3.
+//!   handshake it sends **`IV_tx (12) || IV_rx (12)`** (24 bytes), then optionally runs the leaky
+//!   additive ECDH round (`SETUP_ECDH_LEAKY` + partial points — see `notary::ecdh`).
 //!
 //! Then runs [`notary::tls::run_notary_worker_attested`] until the prover sends
 //!      OP_FINISH (in which case the notary signs and returns the bundle) or
@@ -27,7 +28,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
-use notary::tls::run_notary_worker_attested;
+use notary::tls::{notary_ecdh_after_setup_ivs, run_notary_worker_attested};
 use rand::RngCore;
 use swanky_channel::Channel;
 
@@ -122,6 +123,13 @@ fn read_setup_frame(
             ch.read_bytes(&mut iv_tx)?;
             ch.read_bytes(&mut iv_rx)?;
             eprintln!("notary_proxy: IVs received from {peer}");
+            match notary_ecdh_after_setup_ivs(ch, &mut rand::thread_rng())? {
+                Some(outcome) => eprintln!(
+                    "notary_proxy: leaky additive ECDH — IKM={}",
+                    hex_encode(&outcome.ikm.0)
+                ),
+                None => eprintln!("notary_proxy: leaky ECDH skipped by host ({peer})"),
+            }
             Ok((k_n_tx, iv_tx, k_n_rx, iv_rx))
         }
         other => swanky_error::bail!(

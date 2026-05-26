@@ -198,6 +198,56 @@ pub fn notary_run_leaky_additive<R: Read + Write>(
     })
 }
 
+// ── Post-setup framing (`notary_demo` mode 1 ↔ `notary_proxy`) ───────────────
+
+/// Host sends this after `IV_tx || IV_rx` when skipping the leaky ECDH round.
+pub const SETUP_ECDH_SKIP: u8 = 0;
+/// Host sends this after IVs; then `server_epk` (32 B) + leaky partial exchange.
+pub const SETUP_ECDH_LEAKY: u8 = 1;
+
+/// After AES-key setup (mode 1): flag + optional leaky ECDH on the same byte stream.
+pub fn host_send_ecdh_leaky<R: Read + Write>(
+    io: &mut R,
+    host_share: &EphemeralShare,
+    server_epk: &[u8; 32],
+) -> std::io::Result<LeakyAdditiveOutcome> {
+    io.write_all(&[SETUP_ECDH_LEAKY])?;
+    io.write_all(server_epk)?;
+    host_run_leaky_additive(host_share, server_epk, io)
+}
+
+/// Notary reads the post-IV flag; runs leaky ECDH when requested.
+pub fn notary_recv_ecdh_leaky<R: Read + Write>(
+    io: &mut R,
+    notary_share: &EphemeralShare,
+    rng: &mut impl RngCore,
+) -> std::io::Result<Option<LeakyAdditiveOutcome>> {
+    let mut flag = [0u8; 1];
+    io.read_exact(&mut flag)?;
+    match flag[0] {
+        SETUP_ECDH_SKIP => Ok(None),
+        SETUP_ECDH_LEAKY => {
+            let mut server_epk = [0u8; 32];
+            io.read_exact(&mut server_epk)?;
+            Ok(Some(notary_run_leaky_additive(
+                notary_share,
+                &server_epk,
+                io,
+                rng,
+            )?))
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown SETUP_ECDH flag 0x{other:02x}"),
+        )),
+    }
+}
+
+/// Host skips the leaky ECDH round (single flag byte after IVs).
+pub fn host_skip_ecdh_leaky<W: Write>(io: &mut W) -> std::io::Result<()> {
+    io.write_all(&[SETUP_ECDH_SKIP])
+}
+
 /// Parse X25519 `key_share` (RFC 8446 §4.2.8) from the first inbound TLS handshake record payload.
 ///
 /// `inbound` is raw TCP bytes from server → client. Returns None if not found.

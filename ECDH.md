@@ -14,7 +14,7 @@
 | B — protocol note | ✅ [`notary/doc/PROTOCOL_ECDH.md`](notary/doc/PROTOCOL_ECDH.md) |
 | C — wire + sanity binary | ✅ `host_run_leaky_additive` / `notary_run_leaky_additive`, `ecdh_2pc_sanity --self-test` |
 | C+ — ServerHello parser | ✅ `parse_server_hello_key_share` (for TLS wiring) |
-| D — TLS / `notary_demo` integration | ⬜ not wired yet |
+| D — TLS / `notary_demo` integration | ✅ mode 1: post-IV leaky ECDH on notary TCP (`host_send_ecdh_leaky` / `notary_recv_ecdh_leaky`) |
 | Real OT 2PC (`OtX25519Placeholder`) | ⬜ `TODO.md` #1 |
 
 ---

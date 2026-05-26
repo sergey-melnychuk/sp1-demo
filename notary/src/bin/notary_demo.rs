@@ -28,6 +28,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use notary::ecdh::{
+    generate_share, host_send_ecdh_leaky, host_skip_ecdh_leaky, parse_server_hello_key_share,
+};
 use notary::tls::{
     client_decrypt_record, client_encrypt_record, client_finish_session, tls13_aad,
 };
@@ -75,6 +78,47 @@ struct Args {
     /// is TODO.md #1 — rustls still sees full secrets briefly).
     #[arg(long)]
     legacy_host_xor_masks: bool,
+
+    /// Mode 1 only: skip the leaky additive ECDH round after IVs (sends `SETUP_ECDH_SKIP`).
+    #[arg(long)]
+    skip_ecdh_wire: bool,
+}
+
+/// Wraps a `TcpStream` and records every raw byte in both directions during the TLS handshake.
+struct CapturingStream {
+    inner: TcpStream,
+    inbound: Vec<u8>,
+    outbound: Vec<u8>,
+}
+
+impl CapturingStream {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            inner: stream,
+            inbound: Vec::new(),
+            outbound: Vec::new(),
+        }
+    }
+}
+
+impl Read for CapturingStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.inbound.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl Write for CapturingStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.outbound.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn xor_key(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
@@ -175,31 +219,40 @@ fn main() -> Result<()> {
     }
 
     eprintln!("phase 1: TCP+TLS handshake to {host}:{port}");
-    let mut tcp = TcpStream::connect(format!("{host}:{port}"))?;
+    let tcp = TcpStream::connect(format!("{host}:{port}"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let mut capturing = CapturingStream::new(tcp);
     let mut tls = ClientConnection::new(Arc::new(config), server_name)?;
     // Drive handshake to completion.
     while tls.is_handshaking() {
         if tls.wants_write() {
-            tls.write_tls(&mut tcp).context("write handshake")?;
+            tls.write_tls(&mut capturing).context("write handshake")?;
         }
         if tls.wants_read() {
-            tls.read_tls(&mut tcp).context("read handshake")?;
+            tls.read_tls(&mut capturing).context("read handshake")?;
             tls.process_new_packets().context("process handshake")?;
         }
     }
     // Flush any leftover records rustls has queued (e.g. our own Finished).
     while tls.wants_write() {
-        tls.write_tls(&mut tcp).context("flush post-handshake")?;
+        tls.write_tls(&mut capturing).context("flush post-handshake")?;
     }
     // Drain any post-handshake records the server queued (e.g. NewSessionTicket).
-    tcp.set_read_timeout(Some(Duration::from_millis(150)))?;
-    let _ = tls.read_tls(&mut tcp);
+    capturing
+        .inner
+        .set_read_timeout(Some(Duration::from_millis(150)))?;
+    let _ = tls.read_tls(&mut capturing);
     let _ = tls.process_new_packets();
     while tls.wants_write() {
-        let _ = tls.write_tls(&mut tcp);
+        let _ = tls.write_tls(&mut capturing);
     }
-    tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
+    capturing
+        .inner
+        .set_read_timeout(Some(Duration::from_secs(15)))?;
+    let server_epk = parse_server_hello_key_share(&capturing.inbound);
+    let mut raw_outbound = capturing.outbound;
+    let mut raw_inbound = capturing.inbound;
+    let mut tcp = capturing.inner;
 
     // ── Phase 2: extract traffic secrets ──────────────────────────────────
     let secrets = tls.dangerous_extract_secrets().context("extract secrets")?;
@@ -229,6 +282,25 @@ fn main() -> Result<()> {
         nm.write_all(&tx_iv).context("write IV_tx")?;
         nm.write_all(&rx_iv).context("write IV_rx")?;
         nm.flush().context("flush IVs")?;
+        if args.skip_ecdh_wire {
+            eprintln!("phase 3b: skipping leaky ECDH wire (--skip-ecdh-wire)");
+            host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
+            nm.flush().context("flush ECDH skip")?;
+        } else if let Some(epk) = server_epk {
+            eprintln!("phase 3b: leaky additive ECDH (server epk from ServerHello)");
+            let host_share = generate_share(&mut rand::thread_rng());
+            let outcome =
+                host_send_ecdh_leaky(&mut nm, &host_share, &epk).context("leaky ECDH wire")?;
+            nm.flush().context("flush leaky ECDH")?;
+            eprintln!(
+                "phase 3b: host-side IKM={} (both parties learn full IKM — demo only)",
+                hex_encode(&outcome.ikm.0)
+            );
+        } else {
+            eprintln!("phase 3b: no ServerHello key_share in capture — skipping leaky ECDH");
+            host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
+            nm.flush().context("flush ECDH skip")?;
+        }
         nm
     } else {
         rand::thread_rng().fill_bytes(&mut k_n_tx);
@@ -270,8 +342,6 @@ fn main() -> Result<()> {
 
     // Open ONE swanky channel for the whole session — multiple Channel::with
     // calls would lose buffered bytes between operations.
-    let mut raw_outbound: Vec<u8> = Vec::new();
-    let mut raw_inbound: Vec<u8> = Vec::new();
     let session_result = Channel::with(&mut notary_tcp, |ch| -> swanky_error::Result<_> {
         // Encrypt request via 2PC; send the resulting record to the server.
         let (ct, tag) = client_encrypt_record(ch, k_c_tx, tx_iv, &inner, &aad, tx_seq)?;
