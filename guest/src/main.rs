@@ -512,6 +512,25 @@ fn run_notary_path(witness: &TlsWitness) {
         "notary bundle signature did not verify"
     );
 
+    if att.bundle.bundle_version >= sp1_demo_common::NotaryBundle::BUNDLE_VERSION_BINDING {
+        let b = &att.bundle.binding;
+        let ht = {
+            let mut h = Sha256::new();
+            h.update(&(witness.raw_outbound.len() as u64).to_be_bytes());
+            h.update(&witness.raw_outbound);
+            h.update(&(witness.raw_inbound.len() as u64).to_be_bytes());
+            h.update(&witness.raw_inbound);
+            h.finalize().into()
+        };
+        assert_eq!(
+            ht, b.handshake_transcript_hash,
+            "bundle handshake_transcript_hash != witness raw bytes"
+        );
+        let epk = parse_server_hello_key_share(&witness.raw_inbound)
+            .expect("epk_server in witness inbound");
+        assert_eq!(epk, b.server_epk, "bundle server_epk != ServerHello key_share");
+    }
+
     // 2. Bundle's server_name must match the hostname we're claiming about.
     assert_eq!(
         att.bundle.server_name, witness.hostname,

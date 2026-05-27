@@ -31,6 +31,7 @@ pub fn notary_encrypt_block(
     nonce_ctr: [u8; 16],
 ) -> SwankyResult<()> {
     let rng = SwankyRng::new();
+    let circ = aes_circuit();
     let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
     let mod2 = vec![2u16; 128];
 
@@ -44,7 +45,6 @@ pub fn notary_encrypt_block(
         k_bits.push(gb.xor(&k_n_bits[i], &k_c_bits[i]));
     }
 
-    let circ = aes_circuit();
     let mut circuit_inputs = nonce_bits;
     circuit_inputs.extend_from_slice(&k_bits);
     let keystream = circ.execute(&mut gb, &circuit_inputs, channel)?;
@@ -193,9 +193,9 @@ pub fn notary_encrypt_gcm(
     plaintext_len: usize,
 ) -> SwankyResult<()> {
     let rng = SwankyRng::new();
+    let circ = aes_circuit();
     let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
     let mod2 = vec![2u16; 128];
-    let circ = aes_circuit();
 
     let n_aad_blocks = aad.len().div_ceil(16);
     let n_pt_blocks = plaintext_len.div_ceil(16);
@@ -366,9 +366,9 @@ pub fn notary_decrypt_gcm(
     ciphertext_len: usize,
 ) -> SwankyResult<()> {
     let rng = SwankyRng::new();
+    let circ = aes_circuit();
     let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
     let mod2 = vec![2u16; 128];
-    let circ = aes_circuit();
 
     let n_aad_blocks = aad_len.div_ceil(16);
     let n_ct_blocks = ciphertext_len.div_ceil(16);

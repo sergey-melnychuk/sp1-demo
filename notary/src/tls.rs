@@ -36,7 +36,9 @@ use swanky_error::Result as SwankyResult;
 
 // NotaryBundle / RecordCommit are defined in `sp1-demo-common` so the SP1
 // guest can verify the same struct without depending on this crate.
-pub use sp1_demo_common::{NotaryBundle, RecordCommit};
+pub use sp1_demo_common::{NotaryBundle, RecordCommit, SessionBinding};
+
+use crate::garble::production_session_binding;
 
 use crate::aes::{
     NotaryCommit, client_decrypt_gcm_2pc, client_encrypt_gcm, notary_decrypt_gcm,
@@ -211,6 +213,7 @@ pub struct TwoPcTrafficSetup {
     pub after_sh: [u8; 32],
     pub after_sf: [u8; 32],
     pub ikm_full: [u8; 32],
+    pub binding: SessionBinding,
 }
 
 /// Host: announce 2PC HKDF then derive client traffic key shares.
@@ -267,6 +270,7 @@ pub fn run_notary_worker_attested_2pc(
         iv_tx,
         traffic.k_n_rx,
         iv_rx,
+        setup.binding,
     )
 }
 
@@ -279,7 +283,8 @@ pub fn run_notary_worker(
     k_n_rx: [u8; 16],
     iv_rx: [u8; 12],
 ) -> SwankyResult<()> {
-    run_notary_worker_inner(channel, None, k_n_tx, iv_tx, k_n_rx, iv_rx).map(|_| ())
+    run_notary_worker_inner(channel, None, k_n_tx, iv_tx, k_n_rx, iv_rx, SessionBinding::default())
+        .map(|_| ())
 }
 
 /// Like [`run_notary_worker`] but also tracks a session log and signs a
@@ -293,8 +298,17 @@ pub fn run_notary_worker_attested(
     iv_tx: [u8; 12],
     k_n_rx: [u8; 16],
     iv_rx: [u8; 12],
+    binding: SessionBinding,
 ) -> SwankyResult<Option<NotaryBundle>> {
-    run_notary_worker_inner(channel, Some(signing_key), k_n_tx, iv_tx, k_n_rx, iv_rx)
+    run_notary_worker_inner(
+        channel,
+        Some(signing_key),
+        k_n_tx,
+        iv_tx,
+        k_n_rx,
+        iv_rx,
+        binding,
+    )
 }
 
 fn run_notary_worker_inner(
@@ -304,6 +318,7 @@ fn run_notary_worker_inner(
     iv_tx: [u8; 12],
     k_n_rx: [u8; 16],
     iv_rx: [u8; 12],
+    binding: SessionBinding,
 ) -> SwankyResult<Option<NotaryBundle>> {
     let mut records: Vec<RecordCommit> = Vec::new();
     loop {
@@ -385,6 +400,7 @@ fn run_notary_worker_inner(
                     iv_tx,
                     k_n_rx,
                     iv_rx,
+                    binding,
                 );
                 let serialized = bincode::serialize(&bundle).map_err(|e| {
                     swanky_error::swanky_error!(
@@ -906,7 +922,15 @@ mod tests {
         let (notary_bundle_opt, client_bundle) = local_channel_pair(
             |ch| {
                 // Notary: drive worker; expect bundle returned at OP_FINISH
-                run_notary_worker_attested(ch, &signing_key, k_n, iv, k_n, iv)
+                run_notary_worker_attested(
+                    ch,
+                    &signing_key,
+                    k_n,
+                    iv,
+                    k_n,
+                    iv,
+                    production_session_binding(),
+                )
             },
             |ch| -> SwankyResult<NotaryBundle> {
                 // Client: do one encrypt + one decrypt + finish.
@@ -946,6 +970,14 @@ mod tests {
 
         // Signature verifies
         assert!(client_bundle.verify(), "bundle signature must verify");
+        assert_eq!(
+            client_bundle.bundle_version,
+            NotaryBundle::BUNDLE_VERSION_BINDING
+        );
+        assert_eq!(
+            client_bundle.binding.garbling_mode,
+            crate::circuits::GARBLING_HKDF_AUTH
+        );
 
         // Tampering breaks verification
         let mut bad = client_bundle.clone();

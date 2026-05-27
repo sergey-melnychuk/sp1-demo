@@ -20,7 +20,8 @@
 //!   - Handshake is local-only — the host briefly held K (between step 1 and
 //!     the split + zero in step 3). True "host never has K" requires ECDH 2PC
 //!     (`notary::ecdh::OtX25519Blinded` — host XOR IKM share; rustls still brief full keys).
-//!   - This demo is semi-honest; authenticated garbling not wired in.
+//!   - Mode 2 sends raw handshake bytes to the notary for independent transcript verify.
+//!   - Record-layer 2PC uses authenticated garbling (WRK17).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -34,6 +35,7 @@ use notary::ecdh::{
     host_skip_ecdh_leaky, parse_server_hello_key_share, reference_ikm, share_from_bytes,
     EphemeralShare,
 };
+use notary::handshake::{cert_chain_hash, write_handshake_capture, HandshakeCapture};
 use notary::hkdf::reference_tls13_client_traffic;
 use notary::transcript::transcript_hashes_with_ikm;
 use notary::tls::{
@@ -342,6 +344,13 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
 
         let server_epk = parse_server_hello_key_share(&capturing.inbound)
             .ok_or_else(|| swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "no server epk"))?;
+        let cert_hash = tls
+            .peer_certificates()
+            .map(|certs| {
+                let der: Vec<&[u8]> = certs.iter().map(|c| c.as_ref()).collect();
+                cert_chain_hash(&der)
+            })
+            .unwrap_or([0u8; 32]);
         let ikm_oracle = reference_ikm(&host_share, &notary_share, &server_epk);
         let (after_sh, after_sf) = transcript_hashes_with_ikm(
             &capturing.outbound,
@@ -385,9 +394,16 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
             eprintln!("phase 2: rustls extract matches reference key schedule");
         }
 
-        eprintln!("phase 3: transcript + OT ECDH on notary channel");
-        ch.write_bytes(&after_sh)?;
-        ch.write_bytes(&after_sf)?;
+        eprintln!("phase 3: handshake capture + OT ECDH on notary channel");
+        write_handshake_capture(
+            ch,
+            &HandshakeCapture {
+                server_epk,
+                cert_chain_hash: cert_hash,
+                outbound: capturing.outbound.clone(),
+                inbound: capturing.inbound.clone(),
+            },
+        )?;
         let mut io = ChannelRw(ch);
         let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
             .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
@@ -846,6 +862,21 @@ fn print_demo_output(
         "  verify():       {}",
         if bundle.verify() { "ok" } else { "FAIL" }
     );
+    if bundle.bundle_version >= sp1_demo_common::NotaryBundle::BUNDLE_VERSION_BINDING {
+        let b = &bundle.binding;
+        println!("--- session binding ---");
+        println!("  server_epk:                 {}", hex_encode(&b.server_epk));
+        println!("  cert_chain_hash:            {}", hex_encode(&b.cert_chain_hash));
+        println!(
+            "  handshake_transcript_hash:  {}",
+            hex_encode(&b.handshake_transcript_hash)
+        );
+        println!(
+            "  key_schedule_context_hash:  {}",
+            hex_encode(&b.key_schedule_context_hash)
+        );
+        println!("  garbling_mode:              {}", b.garbling_mode);
+    }
 
     if let Some(out) = args.witness_out.as_ref() {
         use sp1_demo_common::{NotaryAttestation, TlsWitness};

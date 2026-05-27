@@ -269,6 +269,75 @@ pub fn transcript_hashes_with_ikm(
     Some((after_sh, after_sf))
 }
 
+fn parse_cert_message(body: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut pos = 0;
+    if pos >= body.len() {
+        return None;
+    }
+    let ctx_len = body[pos] as usize;
+    pos += 1 + ctx_len;
+    if body.len().checked_sub(pos)? < 3 {
+        return None;
+    }
+    let list_len =
+        u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
+    pos += 3;
+    let list_end = pos.checked_add(list_len)?;
+    if list_end > body.len() {
+        return None;
+    }
+    let mut certs = Vec::new();
+    while pos < list_end {
+        if list_end.checked_sub(pos)? < 3 {
+            return None;
+        }
+        let cert_len =
+            u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
+        pos += 3;
+        if list_end.checked_sub(pos)? < cert_len {
+            return None;
+        }
+        certs.push(body[pos..pos + cert_len].to_vec());
+        pos += cert_len;
+        if list_end.checked_sub(pos)? < 2 {
+            return None;
+        }
+        let ext_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2 + ext_len;
+    }
+    Some(certs)
+}
+
+/// DER certificate chain from the encrypted Certificate handshake message.
+pub fn cert_chain_ders_from_handshake(
+    raw_outbound: &[u8],
+    raw_inbound: &[u8],
+    ikm: &[u8; 32],
+) -> Option<Vec<Vec<u8>>> {
+    let after_sh = transcript_after_server_hello(raw_outbound, raw_inbound)?;
+    let (server_hs_key, server_hs_iv) = reference_server_hs_keys(ikm, &after_sh);
+    let inp = parse_records(raw_inbound)?;
+
+    let mut server_hs_seq = 0u64;
+    for r in &inp {
+        if r.content_type != 0x17 {
+            continue;
+        }
+        let (plain, inner_ct) =
+            decrypt_hs_record(&server_hs_key, &server_hs_iv, server_hs_seq, r)?;
+        server_hs_seq += 1;
+        if inner_ct != 22 {
+            continue;
+        }
+        for (ty, body) in parse_handshake_messages(&plain)? {
+            if ty == 11 {
+                return parse_cert_message(&body);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

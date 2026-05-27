@@ -2,7 +2,8 @@
 
 ## Status (what's built in `notary/`)
 
-**Not production-ready** — working research demo / PoC. See [Trust model gaps](#trust-model-gaps-why-this-is-not-prod-ready) below.
+**Production-ish witness path** for mode 2 — not full malicious-security MPC. See
+[Trust model gaps](#trust-model-gaps-why-this-is-not-prod-ready) below.
 
 ### Demo modes (`notary_demo` ↔ `notary_proxy`)
 
@@ -10,36 +11,32 @@
 |------|------------|------|-------------------|
 | Legacy | `0` | `--legacy-host-xor-masks` | rustls extract → XOR split |
 | Default | `1` | *(none)* | same; split ephemeral + post-IV OT ECDH |
-| 2PC schedule | `2` | `--two-pc-traffic-keys` | **2PC HKDF** from OT IKM XOR shares + transcript hashes; host skips extract for records |
+| 2PC schedule | `2` | `--two-pc-traffic-keys` | **2PC HKDF** from OT IKM XOR shares; notary verifies raw handshake |
 
-Mode 2 E2E verified against real HTTPS (`jsonplaceholder.typicode.com`): HTTP 200, decrypt OK,
-signed bundle verifies. Optional `--verify-rustls-keys` cross-checks 2PC HKDF vs rustls extract.
+Mode 2 E2E: host sends [`HandshakeCapture`](notary/src/handshake.rs) (raw bytes +
+cert hash + epk); notary runs `verify_handshake_capture` after ECDH; then 2PC HKDF
+and AES records. Signed **NotaryBundle v1** includes [`SessionBinding`](common/src/lib.rs).
+Verify with `notary_verify` or SP1 guest (transcript hash + epk checks).
 
 Docs: [`DEMO.md`](DEMO.md), ECDH wire: [`ECDH.md`](ECDH.md).
 
 ### Working primitives
 
-- **`aes.rs`** — split-key 2PC AES-GCM encrypt/decrypt with AAD; byte-identical to `aes-gcm`.
-  Tag check outside circuit (gap #4).
-- **`hkdf.rs`** — 2PC HMAC-SHA256, HKDF-Extract, HKDF-Expand-Label; XOR-shared 32-byte IKM;
-  full TLS 1.3 **client app traffic** schedule (`tls13_traffic_2pc_matches_reference`).
-  SHA-256 compress Bristol circuit (`circuits/sha-256-compress.txt`).
-- **`ecdh.rs`** — additive scalar shares; **OT-blinded** point addition (default wire);
-  leaky cleartext partials (debug); TLS-correct IKM via `reference_ikm` (RFC 7748 clamp).
-  Wire: `SETUP_ECDH_* ‖ server_epk (32) ‖ host_clamped_share (32) ‖ …`.
-  **Not** full OT-MtA — notary still reconstructs full IKM (trusted demo).
-- **`transcript.rs`** — TLS 1.3 handshake transcript hashes (`after_sh`, `after_sf`) for key schedule;
-  used on **host** in mode 2; notary receives precomputed 64 B digests only.
-- **`tls.rs`** — record bridge (`OP_ENCRYPT` / `OP_DECRYPT` / `OP_FINISH` / `OP_2PC_HKDF`),
-  `run_notary_worker_attested` / `run_notary_worker_attested_2pc`, rustls bridge, commit-before-reveal.
-- **`common::NotaryBundle`** — Ed25519-signed attestation (session id, SNI, per-record commit hashes,
-  notary key shares + IVs). Host receives bundle at `OP_FINISH`; `verify()` in guest/tests.
+- **`handshake.rs`** — mode-2 capture wire; notary-side transcript + cert verify.
+- **`aes.rs`** — split-key 2PC AES-GCM (semi-honest); byte-identical to `aes-gcm`.
+- **`hkdf.rs`** — 2PC HMAC/HKDF via **one garbler session per SHA-256 compress**
+  (chains XOR output shares between HMAC rounds); full TLS 1.3 client traffic schedule.
+- **`ecdh.rs`** — OT-blinded ECDH (default); TLS-correct IKM via `reference_ikm`.
+- **`transcript.rs`** — handshake hash parsing (host + notary).
+- **`tls.rs`** — record bridge, attested worker, `OP_2PC_HKDF`.
+- **`common::NotaryBundle`** — v0 legacy + **v1 `SessionBinding`** in signature.
+- **`notary_verify`** — standalone bundle + optional witness cross-check.
+- **`garble.rs`** — WRK17 `SplitSharedInputMaskCircuit`; HKDF compress wired; AES pending.
 
 ### Tests
 
-`cargo test -p notary --lib` — **25 passed**, 1 ignored (~75 s release profile). Includes AES/HKDF/ECDH
-unit tests, rustls bridge round-trip, signed bundle verification, and TCP/local integration tests for
-ECDH → 2PC HKDF (`tls::tests::hkdf_over_*`).
+`cargo test --lib --release` — **28 passed** (~12 s). Includes WRK17 compress
+round-trip, TCP/local ECDH→HKDF integration, signed bundle v1.
 
 ---
 
@@ -49,9 +46,9 @@ Three structural issues block third-party or malicious-security claims:
 
 | Gap | Today | Why it matters |
 |-----|--------|----------------|
-| **Host-side handshake parser** | Host runs `transcript_hashes_with_ikm` locally; sends `after_sh ‖ after_sf` (64 B). Notary trusts host digests. | Malicious host can lie about transcript → wrong keys while still passing 2PC AES with notary. |
-| **Trusted-notary semantics** | Notary learns full IKM (OT path), public IVs, plaintext-side commits; host sends clamped scalar on wire. Bundle signs notary's view, not independently verifiable MPC. | Verifier must trust notary RAM and honest computation, not just cryptography. |
-| **Semi-honest garbling** | `swanky-twopac::semihonest` in `aes.rs` / `hkdf.rs`. | Malicious garbler can cheat; evaluator cannot detect wrong circuits. |
+| **Host-side handshake parser** | **Fixed (mode 2):** host sends raw bytes; notary verifies in `handshake.rs`. Host still uses local `reference_ikm` for optional rustls cross-check only. | Malicious host cannot lie about transcript for mode 2 HKDF binding. |
+| **Trusted-notary semantics** | Bundle v1 signs `SessionBinding` (cert hash, transcript root, epk, circuit IDs). `notary_verify` + guest checks. Notary still learns full IKM. | Verifier can check signature + witness fields; not full MPC secrecy. |
+| **Semi-honest garbling** | HKDF compress uses **WRK17** (`garble.rs`, `SplitSharedInputMaskCircuit`). AES-GCM still `swanky-twopac` semi-honest. | Malicious garbler can cheat on record layer until AES WRK17 lands. |
 
 ### Rationale
 
@@ -83,39 +80,27 @@ Authenticated garbling   (remove “trust notary MPC”)
 OT-MtA ECDH + incremental 2PC schedule   (remove host scalar leak + notary full IKM)
 ```
 
-#### 1. Host-side handshake parser → notary-side verification *(do first)*
+#### 1. Host-side handshake parser → notary-side verification — **done (mode 2)**
 
-- **Wire change (mode 2):** after handshake, host sends length-prefixed `raw_outbound ‖ raw_inbound`
-  (handshake bytes only), not precomputed `after_sh ‖ after_sf`.
-- **Notary:** run `transcript.rs` locally; recompute hashes before `OP_2PC_HKDF`.
-- **IKM dependency:** `after_sf` needs IKM to decrypt ClientFinished — use XOR shares after OT ECDH
-  (`reference_ikm` from wire scalars short-term), or run key schedule **incrementally in 2PC**
-  (hs secrets → decrypt CF → hash → app traffic) long-term.
-- **Abort** if notary hashes ≠ inputs to 2PC HKDF.
+- Wire: [`HandshakeCapture`](notary/src/handshake.rs) (epk, cert hash, raw outbound/inbound).
+- Notary: `verify_handshake_capture` after ECDH; abort before `OP_2PC_HKDF`.
 
-#### 2. Trusted-notary semantics
+#### 2. Trusted-notary semantics — **witness path largely done**
 
 **Witness path (A):**
 
-- Extend `NotaryBundle`: `cert_chain_hash`, `handshake_transcript_hash`, `server_epk`, circuit hashes.
-- Notary signs only bytes/commits it observed during the session.
-- Standalone `notary_verify` tool for third parties.
-- TLS + pinned identity to notary daemon (ops #11).
+- **Done:** `SessionBinding` in NotaryBundle v1; `notary_verify` CLI; guest transcript/epk checks.
+- **Still missing:** TLS to notary daemon; k-of-n threshold.
 
-**2PC path (B):**
+**2PC path (B):** OT-MtA, drop `ikm_full`, incremental schedule — unchanged.
 
-- Remove `host_clamped_share` on wire → OT-MtA (gap #1).
-- Drop `TwoPcTrafficSetup.ikm_full` outside tests; notary holds `ikm_n` only.
-- Remove host `reference_ikm` oracle from mode 2 demo path.
-- Optional k-of-n notary threshold on bundle.
+#### 3. Semi-honest garbling — **HKDF done; AES in progress**
 
-#### 3. Semi-honest garbling
+- **Done:** per-compress HMAC sessions; WRK17 compress with split garbler/evaluator
+  inputs + in-circuit output mask (`hkdf::sha256_compress_2pc_auth_round_matches_reference`).
+- **Next:** AES-GCM — split GHASH (semi-honest) from per-block AES WRK17 sessions.
 
-- Migrate to `swanky-authenticated-garbling` (WRK17): `AuthenticatedWireMod2`, session preprocessing.
-- Pin circuit hashes (AES, SHA-256 compress) in signed bundle.
-- Move GCM tag verify into circuit (gap #4); amortize OT per session (gap #9).
-
-**Minimum “production-ish” bar** (before full MtA): items 1 + witness-path 2 + authenticated garbling.
+**Minimum “production-ish” bar:** items 1 + witness 2 **done**; item 3 **HKDF done**.
 
 ---
 
@@ -133,23 +118,19 @@ shares (~1500–2000 LOC; no swanky primitive — see `mpz`). Until then:
 - Mode 1: host briefly holds full AES keys between extract and `zeroize()`.
 - Mode 2: host never extracts record keys, but still knows full IKM locally for transcript parsing.
 
-### 2. Authenticated garbling *(blocking third-party trust in MPC)*
+### 2. Authenticated garbling *(HKDF done; AES in progress)*
 
-`swanky-twopac::semihonest` throughout. Malicious garbler can submit a different circuit.
-Migrate to authenticated garbling (3–10× bandwidth; full `aes.rs` / `hkdf.rs` API rewiring).
-See [Trust model §3](#3-semi-honest-garbling).
+`swanky-authenticated-garbling` (WRK17) for HKDF SHA-256 compress in mode 2.
+`SplitSharedInputMaskCircuit` in `garble.rs` — one auth share per input wire,
+in-circuit XOR of party shares + output mask. AES-GCM still uses one semi-honest
+garbler for GHASH + multiple AES `execute` calls.
 
-### 3. Signed attestation *(witness path — largely done)*
+### 3. Signed attestation *(witness path — done for v1)*
 
-**Done:** `NotaryBundle` + Ed25519 sign/verify; per-record commit hashes; `OP_FINISH` round-trip;
-tests in `tls::tests::notary_bundle_round_trip`.
+**Done:** `NotaryBundle` v1 + `SessionBinding`; Ed25519 sign/verify; per-record commits;
+`notary_verify`; guest transcript/epk alignment.
 
-**Still missing for publication-grade attestation:**
-
-- Server **certificate chain** in bundle (or hash thereof).
-- **Handshake transcript root** (not host-asserted digests alone).
-- Standalone **verifier CLI** / SP1 guest alignment for full bundle fields.
-- Circuit identity hashes in signed payload.
+**Still missing:** pinned notary TLS; formal publication of binding semantics.
 
 ### 4. Tag-mismatch side-channel
 
@@ -174,10 +155,9 @@ epochs. Production record layer must rerun 2PC derivation on key updates (depend
 
 One record encrypt/decrypt at a time. Need pipelined state machine on the worker thread.
 
-### 8. Handshake binding in attestation *(partial — see trust model)*
+### 8. Handshake binding in attestation — **done (mode 2)**
 
-rustls validates certs on host; **not** surfaced in bundle. Mode 2 sends **host-computed**
-transcript hashes to notary — not raw handshake bytes. Fix: [§1 Host-side handshake parser](#1-host-side-handshake-parser--notary-side-verification-do-first).
+Raw handshake capture + notary verify + `SessionBinding` in signed bundle.
 
 ---
 
@@ -223,12 +203,10 @@ Not started.
 
 If treating this as a roadmap toward a real product:
 
-1. **Notary-side transcript verification** — raw handshake bytes; remove host digest trust.
-2. **Richer signed bundle + verifier tool** — cert chain, transcript root, circuit IDs (#3 remainder, #8).
-3. **Authenticated garbling** — third-party trust in MPC (#2).
-4. **OT-MtA ECDH + incremental 2PC schedule** — true split IKM (#1 completion).
-5. **Selective disclosure** — privacy upside over publishing full transcript (#5).
-6. Performance (#9–#10) + operational (#11–#15).
+1. **WRK17 AES-GCM** — per-block auth sessions; semi-honest GHASH (#2 completion).
+2. **OT-MtA ECDH + incremental 2PC schedule** — true split IKM (#1 completion).
+3. **Selective disclosure** — privacy upside (#5).
+4. Performance (#9–#10) + operational (#11–#15).
 
 Items 1–4 are each non-trivial. Public [`tlsnotary/tlsn`](https://github.com/tlsnotary/tlsn) +
 [`mpz`](https://github.com/privacy-scaling-explorations/mpz) represent years of work on overlapping problems.

@@ -7,14 +7,20 @@
 //! - `tls`   : high-level notary TLS session tooling (usable from host)
 
 pub mod aes;
+pub mod circuits;
 pub mod ecdh;
+pub mod garble;
+pub mod handshake;
 pub mod hkdf;
 pub mod tls;
 pub mod transcript;
 
 // Re-export the public surface so existing code continues to work
 pub use aes::*;
+pub use circuits::*;
 pub use ecdh::*;
+pub use garble::*;
+pub use handshake::*;
 pub use hkdf::*;
 pub use tls::*;
 pub use transcript::*;

@@ -25,10 +25,15 @@ path = "src/bin/notary_demo.rs"
 name = "ecdh_2pc_sanity"
 path = "src/bin/ecdh_2pc_sanity.rs"
 
+[[bin]]
+name = "notary_verify"
+path = "src/bin/notary_verify.rs"
+
 [dependencies]
 sp1-demo-common         = { path = "../common" }
 fancy-garbling          = { git = "https://github.com/GaloisInc/swanky", package = "fancy-garbling" }
 swanky-twopac           = { git = "https://github.com/GaloisInc/swanky", package = "swanky-twopac" }
+swanky-authenticated-garbling = { git = "https://github.com/GaloisInc/swanky", package = "swanky-authenticated-garbling" }
 swanky-channel          = { git = "https://github.com/GaloisInc/swanky", package = "swanky-channel" }
 swanky-rng              = { git = "https://github.com/GaloisInc/swanky", package = "swanky-rng" }
 swanky-error            = { git = "https://github.com/GaloisInc/swanky", package = "swanky-error" }

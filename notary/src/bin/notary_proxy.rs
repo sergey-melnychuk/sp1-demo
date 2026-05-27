@@ -7,9 +7,9 @@
 //! - **`1` — notary-chosen XOR masks:** notary samples `K_N_tx || K_N_rx` (32 bytes) and its
 //!   additive X25519 scalar share (32 bytes), sends both **before** TLS; after IVs the host runs
 //!   OT-blinded ECDH by default (`SETUP_ECDH_OT`) or leaky/skip per host flags.
-//! - **`2` — 2PC traffic keys:** notary sends scalar share only; host sends TLS transcript
-//!   hashes (64 B) after handshake, then OT-blinded ECDH; both parties derive AES traffic keys
-//!   via 2PC HKDF (`--2pc-traffic-keys` in `notary_demo`).
+//! - **`2` — 2PC traffic keys:** notary sends scalar share only; host sends raw
+//!   handshake capture after TLS, then OT-blinded ECDH; notary verifies transcript
+//!   locally before 2PC HKDF (`--two-pc-traffic-keys` in `notary_demo`).
 //!
 //! Then runs [`notary::tls::run_notary_worker_attested`] until the prover sends
 //!      OP_FINISH (in which case the notary signs and returns the bundle) or
@@ -31,6 +31,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use notary::ecdh::{self, share_to_bytes, EcdhSetupOutcome};
+use notary::garble::production_session_binding;
+use notary::handshake::{read_handshake_capture, verify_handshake_capture};
 use notary::tls::{
     notary_ecdh_after_setup_ivs, run_notary_worker_attested, run_notary_worker_attested_2pc,
     TwoPcTrafficSetup,
@@ -96,6 +98,7 @@ enum SetupKeys {
         after_sh: [u8; 32],
         after_sf: [u8; 32],
         ikm_full: [u8; 32],
+        binding: sp1_demo_common::SessionBinding,
     },
 }
 
@@ -178,14 +181,13 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
                     "flush setup after 2PC scalar share: {e}"
                 )
             })?;
-            eprintln!("notary_proxy: pushed scalar share ({peer}), waiting for transcript");
-            let mut transcript = [0u8; 64];
-            ch.read_bytes(&mut transcript)?;
-            let mut after_sh = [0u8; 32];
-            let mut after_sf = [0u8; 32];
-            after_sh.copy_from_slice(&transcript[..32]);
-            after_sf.copy_from_slice(&transcript[32..]);
-            eprintln!("notary_proxy: transcript hashes received from {peer}");
+            eprintln!("notary_proxy: pushed scalar share ({peer}), waiting for handshake capture");
+            let cap = read_handshake_capture(ch)?;
+            eprintln!(
+                "notary_proxy: handshake capture received ({peer}) — outbound={} inbound={}",
+                cap.outbound.len(),
+                cap.inbound.len()
+            );
             let (ikm_n, ikm_full) = match notary_ecdh_after_setup_ivs(ch, &ecdh_share, &mut rand::thread_rng())? {
                 EcdhSetupOutcome::Skipped => {
                     eprintln!("notary_proxy: ECDH skipped — cannot derive 2PC traffic keys");
@@ -215,11 +217,17 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
                     "flush after ECDH before HKDF: {e}"
                 )
             })?;
+            let verified = verify_handshake_capture(&cap, &ikm_full)?;
+            eprintln!(
+                "notary_proxy: verified handshake binding for {peer} (server_epk={})",
+                hex_encode(&verified.binding.server_epk)
+            );
             Ok(SetupKeys::TwoPcPending {
                 ikm_n,
-                after_sh,
-                after_sf,
+                after_sh: verified.after_sh,
+                after_sf: verified.after_sf,
                 ikm_full,
+                binding: verified.binding,
             })
         }
         other => swanky_error::bail!(
@@ -243,7 +251,15 @@ fn handle(stream: TcpStream, signing_key: Arc<SigningKey>) -> swanky_error::Resu
                 iv_rx,
             } => {
                 eprintln!("notary_proxy: setup complete from {peer}, running attested worker");
-                match run_notary_worker_attested(ch, &signing_key, k_n_tx, iv_tx, k_n_rx, iv_rx)? {
+                match run_notary_worker_attested(
+                    ch,
+                    &signing_key,
+                    k_n_tx,
+                    iv_tx,
+                    k_n_rx,
+                    iv_rx,
+                    production_session_binding(),
+                )? {
                     Some(bundle) => eprintln!(
                         "notary_proxy: signed bundle for {peer} — session_id={:?} server={:?} records={}",
                         bundle.session_id,
@@ -258,6 +274,7 @@ fn handle(stream: TcpStream, signing_key: Arc<SigningKey>) -> swanky_error::Resu
                 after_sh,
                 after_sf,
                 ikm_full,
+                binding,
             } => {
                 eprintln!("notary_proxy: 2PC setup complete ({peer}), waiting for OP_2PC_HKDF");
                 match run_notary_worker_attested_2pc(
@@ -268,6 +285,7 @@ fn handle(stream: TcpStream, signing_key: Arc<SigningKey>) -> swanky_error::Resu
                         after_sh,
                         after_sf,
                         ikm_full,
+                        binding,
                     },
                 )? {
                     Some(bundle) => eprintln!(

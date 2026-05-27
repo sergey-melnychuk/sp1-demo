@@ -27,7 +27,7 @@
 //! XOR-shared 32-byte messages (IKM) use [`notary_hmac_sha256_xor_msg`].
 
 use fancy_garbling::{
-    Fancy, FancyBinary, WireMod2,
+    Fancy, FancyBinary,
     circuit::{BinaryCircuit, CircuitExecutor},
 };
 use rand::Rng;
@@ -36,7 +36,7 @@ use swanky_channel::Channel;
 use swanky_error::Result as SwankyResult;
 use swanky_ot_chou_orlandi::{Receiver as OtReceiver, Sender as OtSender};
 use swanky_rng::SwankyRng;
-use swanky_twopac::semihonest::{Evaluator, Garbler};
+use swanky_twopac::semihonest::{Evaluator as SemiEv, Garbler as SemiGb};
 
 use super::bytes_to_bits;
 
@@ -60,6 +60,14 @@ fn sha256_compress_circuit() -> BinaryCircuit {
         "../circuits/sha-256-compress.txt"
     )))
     .expect("bundled SHA-256 compression Bristol circuit is valid")
+}
+
+fn sha256_compress_wrk17_circuit() -> crate::garble::SplitSharedInputMaskCircuit {
+    crate::garble::SplitSharedInputMaskCircuit::new(
+        sha256_compress_circuit(),
+        768,
+        crate::garble::OUTPUT_MASK_BITS,
+    )
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,11 +94,11 @@ fn xor_wires<F: FancyBinary>(f: &mut F, a: &[F::Item], b: &[F::Item]) -> Vec<F::
 /// Produce wires representing the value `byte_share_n XOR byte_share_c` where
 /// the notary contributes `notary_share` and the client contributes `client_share`.
 /// Both parties call this in lockstep.
-fn gb_split_bytes(
-    gb: &mut Garbler<SwankyRng, OtSender, WireMod2>,
+fn gb_split_bytes<F: FancyBinary>(
+    gb: &mut F,
     channel: &mut Channel,
     notary_share: &[u8],
-) -> SwankyResult<Vec<WireMod2>> {
+) -> SwankyResult<Vec<F::Item>> {
     let bits = bytes_to_bits(notary_share);
     let n = bits.len();
     let mod2 = vec![2u16; n];
@@ -99,17 +107,191 @@ fn gb_split_bytes(
     Ok(xor_wires(gb, &notary_wires, &client_wires))
 }
 
-fn ev_split_bytes(
-    ev: &mut Evaluator<SwankyRng, OtReceiver, WireMod2>,
+fn ev_split_bytes<F: FancyBinary>(
+    ev: &mut F,
     channel: &mut Channel,
     client_share: &[u8],
-) -> SwankyResult<Vec<WireMod2>> {
+) -> SwankyResult<Vec<F::Item>> {
     let bits = bytes_to_bits(client_share);
     let n = bits.len();
     let mod2 = vec![2u16; n];
     let notary_wires = ev.receive_many(&mod2, channel)?;
     let client_wires = ev.encode_many(&bits, &mod2, channel)?;
     Ok(xor_wires(ev, &notary_wires, &client_wires))
+}
+
+/// One SHA-256 compression round (WRK17 authenticated garbling).
+fn notary_sha256_compress_xor(
+    channel: &mut Channel,
+    iv_n: [u8; 32],
+    block_n: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    notary_sha256_compress_xor_wrk17(channel, iv_n, block_n)
+}
+
+fn client_sha256_compress_xor(
+    channel: &mut Channel,
+    iv_c: [u8; 32],
+    block_c: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    client_sha256_compress_xor_wrk17(channel, iv_c, block_c)
+}
+
+fn compress_xor_notary<F: FancyBinary>(
+    gb: &mut F,
+    channel: &mut Channel,
+    circ: &BinaryCircuit,
+    iv_n: [u8; 32],
+    block_n: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    let iv_wires = gb_split_bytes(gb, channel, &iv_n)?;
+    let block_wires = gb_split_bytes(gb, channel, &block_n)?;
+    let mut inputs = iv_wires;
+    inputs.extend(block_wires);
+    let out = circ.execute(gb, &inputs, channel)?;
+    notary_mask_output(gb, channel, &out)
+}
+
+fn compress_xor_client<F: FancyBinary>(
+    ev: &mut F,
+    channel: &mut Channel,
+    circ: &BinaryCircuit,
+    iv_c: [u8; 32],
+    block_c: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    let iv_wires = ev_split_bytes(ev, channel, &iv_c)?;
+    let block_wires = ev_split_bytes(ev, channel, &block_c)?;
+    let mut inputs = iv_wires;
+    inputs.extend(block_wires);
+    let out = circ.execute(ev, &inputs, channel)?;
+    client_unmask_output(ev, channel, &out)
+}
+
+#[cfg(test)]
+fn notary_sha256_compress_xor_semihonest(
+    channel: &mut Channel,
+    iv_n: [u8; 32],
+    block_n: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    use fancy_garbling::WireMod2;
+    let rng = SwankyRng::new();
+    let circ = sha256_compress_circuit();
+    let mut gb = SemiGb::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
+    compress_xor_notary(&mut gb, channel, &circ, iv_n, block_n)
+}
+
+#[cfg(test)]
+fn client_sha256_compress_xor_semihonest(
+    channel: &mut Channel,
+    iv_c: [u8; 32],
+    block_c: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    use fancy_garbling::WireMod2;
+    let rng = SwankyRng::new();
+    let circ = sha256_compress_circuit();
+    let mut ev = SemiEv::<SwankyRng, OtReceiver, WireMod2>::new(channel, rng)?;
+    compress_xor_client(&mut ev, channel, &circ, iv_c, block_c)
+}
+
+fn notary_mask_output<F: FancyBinary>(
+    f: &mut F,
+    channel: &mut Channel,
+    wires: &[F::Item],
+) -> SwankyResult<[u8; 32]> {
+    let mut m_n = [0u8; 32];
+    rand::thread_rng().fill(&mut m_n);
+    let mask = f.encode_many(&bytes_to_bits(&m_n), &vec![2u16; 256], channel)?;
+    let masked = xor_wires(f, wires, &mask);
+    f.outputs(&masked, channel)?;
+    Ok(m_n)
+}
+
+fn client_unmask_output<F: FancyBinary>(
+    f: &mut F,
+    channel: &mut Channel,
+    wires: &[F::Item],
+) -> SwankyResult<[u8; 32]> {
+    let mask = f.receive_many(&vec![2u16; 256], channel)?;
+    let masked = xor_wires(f, wires, &mask);
+    let vals = f
+        .outputs(&masked, channel)?
+        .expect("evaluator always receives output");
+    Ok(bits_to_bytes_32(&vals))
+}
+
+/// WRK17 compress: garbler/evaluator input regions + in-circuit XOR (one auth share per wire).
+fn compress_xor_notary_wrk17(
+    gb: &mut impl FancyBinary,
+    channel: &mut Channel,
+    circ: &crate::garble::SplitSharedInputMaskCircuit,
+    iv_n: [u8; 32],
+    block_n: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    let mut m_n = [0u8; 32];
+    rand::thread_rng().fill(&mut m_n);
+
+    let mut gb_vals = Vec::with_capacity(circ.garbler_inputs());
+    gb_vals.extend(bytes_to_bits(
+        &[&iv_n[..], &block_n[..]].concat(),
+    ));
+    gb_vals.extend(bytes_to_bits(&m_n));
+
+    let mod2 = vec![2u16; circ.garbler_inputs()];
+    let mine = gb.encode_many(&gb_vals, &mod2, channel)?;
+    let theirs = gb.receive_many(&vec![2u16; circ.evaluator_inputs()], channel)?;
+    let mut inputs = mine;
+    inputs.extend(theirs);
+
+    let out = circ.execute(gb, &inputs, channel)?;
+    gb.outputs(&out, channel)?;
+    Ok(m_n)
+}
+
+fn compress_xor_client_wrk17(
+    ev: &mut impl FancyBinary,
+    channel: &mut Channel,
+    circ: &crate::garble::SplitSharedInputMaskCircuit,
+    iv_c: [u8; 32],
+    block_c: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    let mut ev_vals = Vec::with_capacity(circ.evaluator_inputs());
+    ev_vals.extend(bytes_to_bits(
+        &[&iv_c[..], &block_c[..]].concat(),
+    ));
+    ev_vals.extend(vec![0u16; crate::garble::OUTPUT_MASK_BITS]);
+
+    let notary = ev.receive_many(&vec![2u16; circ.garbler_inputs()], channel)?;
+    let mine = ev.encode_many(&ev_vals, &vec![2u16; circ.evaluator_inputs()], channel)?;
+    let mut inputs = notary;
+    inputs.extend(mine);
+
+    let out = circ.execute(ev, &inputs, channel)?;
+    let vals = ev
+        .outputs(&out, channel)?
+        .expect("WRK17 evaluator receives circuit output");
+    Ok(bits_to_bytes_32(&vals))
+}
+
+fn notary_sha256_compress_xor_wrk17(
+    channel: &mut Channel,
+    iv_n: [u8; 32],
+    block_n: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    let rng = SwankyRng::new();
+    let circ = sha256_compress_wrk17_circuit();
+    let mut gb = crate::garble::Garbler::new(&circ, channel, rng)?;
+    compress_xor_notary_wrk17(&mut gb, channel, &circ, iv_n, block_n)
+}
+
+fn client_sha256_compress_xor_wrk17(
+    channel: &mut Channel,
+    iv_c: [u8; 32],
+    block_c: [u8; 64],
+) -> SwankyResult<[u8; 32]> {
+    let mut rng = SwankyRng::new();
+    let circ = sha256_compress_wrk17_circuit();
+    let mut ev = crate::garble::Evaluator::new(&circ, channel, &mut rng)?;
+    compress_xor_client_wrk17(&mut ev, channel, &circ, iv_c, block_c)
 }
 
 /// Asymmetric encoding of the single-block HMAC inner-message: the message
@@ -170,11 +352,6 @@ pub fn notary_hmac_sha256(
     key_n: [u8; 32],
     msg_len: usize,
 ) -> SwankyResult<[u8; 32]> {
-    let rng = SwankyRng::new();
-    let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
-    let circ = sha256_compress_circuit();
-
-    // K' XOR ipad / opad on the notary side (K_C contribution comes via OT later)
     let mut k_ipad_n = [0u8; 64];
     let mut k_opad_n = [0u8; 64];
     for i in 0..32 {
@@ -186,53 +363,18 @@ pub fn notary_hmac_sha256(
         k_opad_n[i] = OPAD;
     }
 
-    // ── Inner block 1: compress(std_IV, K' XOR ipad) ──────────────────────
-    // IV is the standard SHA-256 IV (public). Both sides contribute: notary
-    // provides std_IV, client provides zeros. XOR gives std_IV.
-    let iv_wires = gb_split_bytes(&mut gb, channel, &SHA256_INITIAL_IV_BYTES)?;
-    let msg_wires = gb_split_bytes(&mut gb, channel, &k_ipad_n)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_inner_1 = circ.execute(&mut gb, &inputs, channel)?;
-
-    // ── Inner block 2: compress(h_inner_1, msg_padded) ────────────────────
-    // Notary contributes the deterministic SHA-padding suffix
-    // (knows msg_len, not msg content). Client contributes the msg bytes.
-    // XOR inside the circuit reconstructs the full padded block.
+    let h_inner_1_n =
+        notary_sha256_compress_xor(channel, SHA256_INITIAL_IV_BYTES, k_ipad_n)?;
     let notary_pad = notary_inner_padding(msg_len);
-    let msg_wires = gb_split_bytes(&mut gb, channel, &notary_pad)?;
-    let mut inputs = h_inner_1.clone();
-    inputs.extend(msg_wires);
-    let h_inner_final = circ.execute(&mut gb, &inputs, channel)?;
+    let h_inner_final_n = notary_sha256_compress_xor(channel, h_inner_1_n, notary_pad)?;
+    let h_outer_1_n =
+        notary_sha256_compress_xor(channel, SHA256_INITIAL_IV_BYTES, k_opad_n)?;
 
-    // ── Outer block 1: compress(std_IV, K' XOR opad) ──────────────────────
-    let iv_wires = gb_split_bytes(&mut gb, channel, &SHA256_INITIAL_IV_BYTES)?;
-    let msg_wires = gb_split_bytes(&mut gb, channel, &k_opad_n)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_outer_1 = circ.execute(&mut gb, &inputs, channel)?;
-
-    // ── Outer block 2: compress(h_outer_1, h_inner_final || padding) ──────
     let outer_suffix = outer_suffix_padding();
-    let suffix_wires = gb_split_bytes(&mut gb, channel, &outer_suffix)?;
-    let mut inputs = h_outer_1;
-    inputs.extend(h_inner_final);
-    inputs.extend(suffix_wires);
-    let hmac_wires = circ.execute(&mut gb, &inputs, channel)?;
-
-    // ── Share the output: garbler picks a random mask, XORs into output,
-    //    reveals the masked value to the evaluator. Notary's share = mask.
-    let mut m_n_bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut m_n_bytes);
-    let mask_wires = gb.encode_many(
-        &bytes_to_bits(&m_n_bytes),
-        &vec![2u16; 256],
-        channel,
-    )?;
-    let masked = xor_wires(&mut gb, &hmac_wires, &mask_wires);
-    gb.outputs(&masked, channel)?;
-
-    Ok(m_n_bytes)
+    let mut block_n = [0u8; 64];
+    block_n[..32].copy_from_slice(&h_inner_final_n);
+    block_n[32..].copy_from_slice(&outer_suffix);
+    notary_sha256_compress_xor(channel, h_outer_1_n, block_n)
 }
 
 /// Client side of 2PC HMAC-SHA256.
@@ -241,55 +383,21 @@ pub fn client_hmac_sha256(
     key_c: [u8; 32],
     msg: &[u8],
 ) -> SwankyResult<[u8; 32]> {
-    let rng = SwankyRng::new();
-    let mut ev = Evaluator::<SwankyRng, OtReceiver, WireMod2>::new(channel, rng)?;
-    let circ = sha256_compress_circuit();
-
     let mut k_ipad_c = [0u8; 64];
     let mut k_opad_c = [0u8; 64];
     for i in 0..32 {
-        k_ipad_c[i] = key_c[i]; // ipad XOR happens on the notary side (XOR with constant)
+        k_ipad_c[i] = key_c[i];
         k_opad_c[i] = key_c[i];
     }
-    // Bytes 32..64 stay zero — only the notary contributes ipad/opad to that region.
 
-    // Inner block 1
-    let iv_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
-    let msg_wires = ev_split_bytes(&mut ev, channel, &k_ipad_c)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_inner_1 = circ.execute(&mut ev, &inputs, channel)?;
-
-    // Inner block 2 — client encodes the actual message bytes (zero-padded
-    // to 64 bytes); notary encodes the SHA-padding suffix. XOR = msg||pad.
+    let h_inner_1_c = client_sha256_compress_xor(channel, [0u8; 32], k_ipad_c)?;
     let client_msg_block = client_inner_msg(msg);
-    let msg_wires = ev_split_bytes(&mut ev, channel, &client_msg_block)?;
-    let mut inputs = h_inner_1.clone();
-    inputs.extend(msg_wires);
-    let h_inner_final = circ.execute(&mut ev, &inputs, channel)?;
+    let h_inner_final_c = client_sha256_compress_xor(channel, h_inner_1_c, client_msg_block)?;
+    let h_outer_1_c = client_sha256_compress_xor(channel, [0u8; 32], k_opad_c)?;
 
-    // Outer block 1
-    let iv_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
-    let msg_wires = ev_split_bytes(&mut ev, channel, &k_opad_c)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_outer_1 = circ.execute(&mut ev, &inputs, channel)?;
-
-    // Outer block 2
-    let suffix_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
-    let mut inputs = h_outer_1;
-    inputs.extend(h_inner_final);
-    inputs.extend(suffix_wires);
-    let hmac_wires = circ.execute(&mut ev, &inputs, channel)?;
-
-    // Receive the mask wires from the notary (they hold the value secret)
-    let mask_wires = ev.receive_many(&vec![2u16; 256], channel)?;
-    let masked = xor_wires(&mut ev, &hmac_wires, &mask_wires);
-    let vals = ev
-        .outputs(&masked, channel)?
-        .expect("evaluator always receives output");
-
-    Ok(bits_to_bytes_32(&vals))
+    let mut block_c = [0u8; 64];
+    block_c[..32].copy_from_slice(&h_inner_final_c);
+    client_sha256_compress_xor(channel, h_outer_1_c, block_c)
 }
 
 // ── HKDF-Extract ──────────────────────────────────────────────────────────────
@@ -392,10 +500,6 @@ fn notary_hmac_sha256_xor_msg_inner(
     key_n: [u8; 32],
     msg_n: [u8; 32],
 ) -> SwankyResult<[u8; 32]> {
-    let rng = SwankyRng::new();
-    let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
-    let circ = sha256_compress_circuit();
-
     let mut k_ipad_n = [0u8; 64];
     let mut k_opad_n = [0u8; 64];
     for i in 0..32 {
@@ -407,41 +511,18 @@ fn notary_hmac_sha256_xor_msg_inner(
         k_opad_n[i] = OPAD;
     }
 
-    let iv_wires = gb_split_bytes(&mut gb, channel, &SHA256_INITIAL_IV_BYTES)?;
-    let msg_wires = gb_split_bytes(&mut gb, channel, &k_ipad_n)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_inner_1 = circ.execute(&mut gb, &inputs, channel)?;
-
+    let h_inner_1_n =
+        notary_sha256_compress_xor(channel, SHA256_INITIAL_IV_BYTES, k_ipad_n)?;
     let notary_pad = notary_xor_msg_block(&msg_n);
-    let msg_wires = gb_split_bytes(&mut gb, channel, &notary_pad)?;
-    let mut inputs = h_inner_1.clone();
-    inputs.extend(msg_wires);
-    let h_inner_final = circ.execute(&mut gb, &inputs, channel)?;
-
-    let iv_wires = gb_split_bytes(&mut gb, channel, &SHA256_INITIAL_IV_BYTES)?;
-    let msg_wires = gb_split_bytes(&mut gb, channel, &k_opad_n)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_outer_1 = circ.execute(&mut gb, &inputs, channel)?;
+    let h_inner_final_n = notary_sha256_compress_xor(channel, h_inner_1_n, notary_pad)?;
+    let h_outer_1_n =
+        notary_sha256_compress_xor(channel, SHA256_INITIAL_IV_BYTES, k_opad_n)?;
 
     let outer_suffix = outer_suffix_padding();
-    let suffix_wires = gb_split_bytes(&mut gb, channel, &outer_suffix)?;
-    let mut inputs = h_outer_1;
-    inputs.extend(h_inner_final);
-    inputs.extend(suffix_wires);
-    let hmac_wires = circ.execute(&mut gb, &inputs, channel)?;
-
-    let mut m_n_bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut m_n_bytes);
-    let mask_wires = gb.encode_many(
-        &bytes_to_bits(&m_n_bytes),
-        &vec![2u16; 256],
-        channel,
-    )?;
-    let masked = xor_wires(&mut gb, &hmac_wires, &mask_wires);
-    gb.outputs(&masked, channel)?;
-    Ok(m_n_bytes)
+    let mut block_n = [0u8; 64];
+    block_n[..32].copy_from_slice(&h_inner_final_n);
+    block_n[32..].copy_from_slice(&outer_suffix);
+    notary_sha256_compress_xor(channel, h_outer_1_n, block_n)
 }
 
 /// Client side of [`notary_hmac_sha256_xor_msg`].
@@ -458,10 +539,6 @@ fn client_hmac_sha256_xor_msg_inner(
     key_c: [u8; 32],
     msg_c: [u8; 32],
 ) -> SwankyResult<[u8; 32]> {
-    let rng = SwankyRng::new();
-    let mut ev = Evaluator::<SwankyRng, OtReceiver, WireMod2>::new(channel, rng)?;
-    let circ = sha256_compress_circuit();
-
     let mut k_ipad_c = [0u8; 64];
     let mut k_opad_c = [0u8; 64];
     for i in 0..32 {
@@ -469,36 +546,14 @@ fn client_hmac_sha256_xor_msg_inner(
         k_opad_c[i] = key_c[i];
     }
 
-    let iv_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
-    let msg_wires = ev_split_bytes(&mut ev, channel, &k_ipad_c)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_inner_1 = circ.execute(&mut ev, &inputs, channel)?;
-
+    let h_inner_1_c = client_sha256_compress_xor(channel, [0u8; 32], k_ipad_c)?;
     let client_block = client_xor_msg_block(&msg_c);
-    let msg_wires = ev_split_bytes(&mut ev, channel, &client_block)?;
-    let mut inputs = h_inner_1.clone();
-    inputs.extend(msg_wires);
-    let h_inner_final = circ.execute(&mut ev, &inputs, channel)?;
+    let h_inner_final_c = client_sha256_compress_xor(channel, h_inner_1_c, client_block)?;
+    let h_outer_1_c = client_sha256_compress_xor(channel, [0u8; 32], k_opad_c)?;
 
-    let iv_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
-    let msg_wires = ev_split_bytes(&mut ev, channel, &k_opad_c)?;
-    let mut inputs = iv_wires;
-    inputs.extend(msg_wires);
-    let h_outer_1 = circ.execute(&mut ev, &inputs, channel)?;
-
-    let suffix_wires = ev_split_bytes(&mut ev, channel, &[0u8; 32])?;
-    let mut inputs = h_outer_1;
-    inputs.extend(h_inner_final);
-    inputs.extend(suffix_wires);
-    let hmac_wires = circ.execute(&mut ev, &inputs, channel)?;
-
-    let mask_wires = ev.receive_many(&vec![2u16; 256], channel)?;
-    let masked = xor_wires(&mut ev, &hmac_wires, &mask_wires);
-    let vals = ev
-        .outputs(&masked, channel)?
-        .expect("evaluator always receives output");
-    Ok(bits_to_bytes_32(&vals))
+    let mut block_c = [0u8; 64];
+    block_c[..32].copy_from_slice(&h_inner_final_c);
+    client_sha256_compress_xor(channel, h_outer_1_c, block_c)
 }
 
 /// HKDF-Extract with XOR-shared 32-byte IKM (neither party holds full IKM).
@@ -687,6 +742,76 @@ mod tests {
 
     fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
         std::array::from_fn(|i| a[i] ^ b[i])
+    }
+
+    fn reference_sha256_compress(iv: [u8; 32], block: [u8; 64]) -> [u8; 32] {
+        use sha2::compress256;
+        use sha2::digest::generic_array::GenericArray;
+
+        let mut state: [u32; 8] = std::array::from_fn(|i| {
+            u32::from_be_bytes(iv[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        let block_ga = GenericArray::clone_from_slice(&block);
+        compress256(&mut state, core::slice::from_ref(&block_ga));
+        let mut out = [0u8; 32];
+        for (i, w) in state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn sha256_compress_2pc_round_matches_reference() {
+        let iv_n = SHA256_INITIAL_IV_BYTES;
+        let iv_c = [0u8; 32];
+        let block_n = [0x2bu8; 64];
+        let block_c = [0x55u8; 64];
+        let iv = xor32(iv_n, iv_c);
+        let block = std::array::from_fn(|i| block_n[i] ^ block_c[i]);
+        let expected = reference_sha256_compress(iv, block);
+
+        let (n_share, c_share) = local_channel_pair(
+            |ch| notary_sha256_compress_xor(ch, iv_n, block_n),
+            |ch| client_sha256_compress_xor(ch, iv_c, block_c),
+        )
+        .unwrap();
+        assert_eq!(xor32(n_share, c_share), expected);
+    }
+
+    #[test]
+    fn sha256_compress_2pc_semihonest_round_matches_reference() {
+        let iv_n = SHA256_INITIAL_IV_BYTES;
+        let iv_c = [0u8; 32];
+        let block_n = [0x2bu8; 64];
+        let block_c = [0x55u8; 64];
+        let iv = xor32(iv_n, iv_c);
+        let block = std::array::from_fn(|i| block_n[i] ^ block_c[i]);
+        let expected = reference_sha256_compress(iv, block);
+
+        let (n_share, c_share) = local_channel_pair(
+            |ch| notary_sha256_compress_xor_semihonest(ch, iv_n, block_n),
+            |ch| client_sha256_compress_xor_semihonest(ch, iv_c, block_c),
+        )
+        .unwrap();
+        assert_eq!(xor32(n_share, c_share), expected);
+    }
+
+    #[test]
+    fn sha256_compress_2pc_auth_round_matches_reference() {
+        let iv_n = SHA256_INITIAL_IV_BYTES;
+        let iv_c = [0u8; 32];
+        let block_n = [0x2bu8; 64];
+        let block_c = [0x55u8; 64];
+        let iv = xor32(iv_n, iv_c);
+        let block = std::array::from_fn(|i| block_n[i] ^ block_c[i]);
+        let expected = reference_sha256_compress(iv, block);
+
+        let (n_share, c_share) = local_channel_pair(
+            |ch| notary_sha256_compress_xor_wrk17(ch, iv_n, block_n),
+            |ch| client_sha256_compress_xor_wrk17(ch, iv_c, block_c),
+        )
+        .unwrap();
+        assert_eq!(xor32(n_share, c_share), expected);
     }
 
     /// 2PC HMAC-SHA256 matches the `hmac` crate's HMAC-SHA256 for short messages

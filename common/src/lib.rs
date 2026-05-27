@@ -8,6 +8,25 @@ use serde::{Deserialize, Serialize};
 // the bundle is bincode-serialized over the wire from notary → host →
 // SP1 guest stdin.
 
+/// Witness-path session binding committed in the Ed25519 signature (bundle v2).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SessionBinding {
+    /// ServerHello X25519 key_share (32 B).
+    pub server_epk: [u8; 32],
+    /// SHA-256 of length-prefixed peer certificate DER chain.
+    pub cert_chain_hash: [u8; 32],
+    /// SHA-256 of length-prefixed raw outbound || inbound handshake bytes.
+    pub handshake_transcript_hash: [u8; 32],
+    /// SHA-256(`after_server_hello || after_server_finished`).
+    pub key_schedule_context_hash: [u8; 32],
+    /// SHA-256 of bundled `AES-non-expanded.txt`.
+    pub circuit_aes_sha256: [u8; 32],
+    /// SHA-256 of bundled `sha-256-compress.txt`.
+    pub circuit_sha256_compress_sha256: [u8; 32],
+    /// `0` = semi-honest twopac (legacy), `1` = authenticated garbling.
+    pub garbling_mode: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordCommit {
     pub op: u8,
@@ -18,6 +37,9 @@ pub struct RecordCommit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotaryBundle {
+    /// `1` = includes [`SessionBinding`] in signature; `0` = legacy (pre-binding).
+    #[serde(default)]
+    pub bundle_version: u8,
     pub notary_pubkey: [u8; 32],
     pub timestamp_unix: u64,
     pub session_id: String,
@@ -27,13 +49,64 @@ pub struct NotaryBundle {
     pub iv_tx: [u8; 12],
     pub k_n_rx: [u8; 16],
     pub iv_rx: [u8; 12],
+    #[serde(default)]
+    pub binding: SessionBinding,
     pub signature: Vec<u8>,
 }
 
 impl NotaryBundle {
+    pub const BUNDLE_VERSION_LEGACY: u8 = 0;
+    pub const BUNDLE_VERSION_BINDING: u8 = 1;
+
     /// Canonical byte encoding for signing (deterministic across host/notary/guest).
     #[allow(clippy::too_many_arguments)]
     pub fn canonical_signing_bytes(
+        bundle_version: u8,
+        notary_pubkey: &[u8; 32],
+        timestamp_unix: u64,
+        session_id: &str,
+        server_name: &str,
+        records: &[RecordCommit],
+        k_n_tx: &[u8; 16],
+        iv_tx: &[u8; 12],
+        k_n_rx: &[u8; 16],
+        iv_rx: &[u8; 12],
+        binding: &SessionBinding,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(bundle_version);
+        buf.extend_from_slice(notary_pubkey);
+        buf.extend_from_slice(&timestamp_unix.to_be_bytes());
+        buf.extend_from_slice(&(session_id.len() as u16).to_be_bytes());
+        buf.extend_from_slice(session_id.as_bytes());
+        buf.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(server_name.as_bytes());
+        buf.extend_from_slice(&(records.len() as u32).to_be_bytes());
+        for r in records {
+            buf.push(r.op);
+            buf.extend_from_slice(&r.seq.to_be_bytes());
+            buf.extend_from_slice(&(r.aad.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&r.aad);
+            buf.extend_from_slice(&r.commit_hash);
+        }
+        buf.extend_from_slice(k_n_tx);
+        buf.extend_from_slice(iv_tx);
+        buf.extend_from_slice(k_n_rx);
+        buf.extend_from_slice(iv_rx);
+        if bundle_version >= Self::BUNDLE_VERSION_BINDING {
+            buf.extend_from_slice(&binding.server_epk);
+            buf.extend_from_slice(&binding.cert_chain_hash);
+            buf.extend_from_slice(&binding.handshake_transcript_hash);
+            buf.extend_from_slice(&binding.key_schedule_context_hash);
+            buf.extend_from_slice(&binding.circuit_aes_sha256);
+            buf.extend_from_slice(&binding.circuit_sha256_compress_sha256);
+            buf.push(binding.garbling_mode);
+        }
+        buf
+    }
+
+    /// Pre-binding (v0) signing bytes — no version prefix, no [`SessionBinding`].
+    pub fn legacy_signing_bytes_pre_binding(
         notary_pubkey: &[u8; 32],
         timestamp_unix: u64,
         session_id: &str,
@@ -77,12 +150,37 @@ impl NotaryBundle {
         iv_tx: [u8; 12],
         k_n_rx: [u8; 16],
         iv_rx: [u8; 12],
+        binding: SessionBinding,
+    ) -> Self {
+        Self::sign_with_version(
+            signing_key,
+            Self::BUNDLE_VERSION_BINDING,
+            session_id,
+            server_name,
+            records,
+            k_n_tx,
+            iv_tx,
+            k_n_rx,
+            iv_rx,
+            binding,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_with_version(
+        signing_key: &ed25519_dalek::SigningKey,
+        bundle_version: u8,
+        session_id: String,
+        server_name: String,
+        records: Vec<RecordCommit>,
+        k_n_tx: [u8; 16],
+        iv_tx: [u8; 12],
+        k_n_rx: [u8; 16],
+        iv_rx: [u8; 12],
+        binding: SessionBinding,
     ) -> Self {
         use ed25519_dalek::Signer;
         let notary_pubkey = signing_key.verifying_key().to_bytes();
-        // Note: SystemTime::now() doesn't exist in `no_std` (SP1 guest). On the
-        // notary side this is called with std, so it's fine. The guest never
-        // calls sign() — it only verifies.
         #[cfg(not(target_os = "zkvm"))]
         let timestamp_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -91,6 +189,7 @@ impl NotaryBundle {
         #[cfg(target_os = "zkvm")]
         let timestamp_unix: u64 = 0;
         let bytes = Self::canonical_signing_bytes(
+            bundle_version,
             &notary_pubkey,
             timestamp_unix,
             &session_id,
@@ -100,9 +199,11 @@ impl NotaryBundle {
             &iv_tx,
             &k_n_rx,
             &iv_rx,
+            &binding,
         );
         let signature = signing_key.sign(&bytes).to_bytes().to_vec();
         NotaryBundle {
+            bundle_version,
             notary_pubkey,
             timestamp_unix,
             session_id,
@@ -112,6 +213,7 @@ impl NotaryBundle {
             iv_tx,
             k_n_rx,
             iv_rx,
+            binding,
             signature,
         }
     }
@@ -128,17 +230,33 @@ impl NotaryBundle {
             return false;
         };
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        let bytes = Self::canonical_signing_bytes(
-            &self.notary_pubkey,
-            self.timestamp_unix,
-            &self.session_id,
-            &self.server_name,
-            &self.records,
-            &self.k_n_tx,
-            &self.iv_tx,
-            &self.k_n_rx,
-            &self.iv_rx,
-        );
+        let bytes = if self.bundle_version >= Self::BUNDLE_VERSION_BINDING {
+            Self::canonical_signing_bytes(
+                self.bundle_version,
+                &self.notary_pubkey,
+                self.timestamp_unix,
+                &self.session_id,
+                &self.server_name,
+                &self.records,
+                &self.k_n_tx,
+                &self.iv_tx,
+                &self.k_n_rx,
+                &self.iv_rx,
+                &self.binding,
+            )
+        } else {
+            Self::legacy_signing_bytes_pre_binding(
+                &self.notary_pubkey,
+                self.timestamp_unix,
+                &self.session_id,
+                &self.server_name,
+                &self.records,
+                &self.k_n_tx,
+                &self.iv_tx,
+                &self.k_n_rx,
+                &self.iv_rx,
+            )
+        };
         vk.verify(&bytes, &sig).is_ok()
     }
 }
