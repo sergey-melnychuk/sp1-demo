@@ -740,7 +740,12 @@ impl MessageDecrypter for TwoPartyDecrypter {
 mod tests {
     use super::*;
     use crate::aes;
+    use crate::hkdf::{
+        client_tls13_client_traffic_from_ikm_shares, notary_tls13_client_traffic_from_ikm_shares,
+        reference_tls13_client_traffic, xor16, xor32,
+    };
     use std::net::{TcpListener, TcpStream};
+    use std::thread;
     use swanky_channel::local::local_channel_pair;
 
     fn xor_keys(k_n: [u8; 16], k_c: [u8; 16]) -> [u8; 16] {
@@ -950,6 +955,353 @@ mod tests {
         let mut bad2 = client_bundle.clone();
         bad2.records[0].commit_hash[0] ^= 0xff;
         assert!(!bad2.verify(), "tampered commit hash must not verify");
+    }
+
+    /// 2PC HKDF over TCP — both peers use [`Channel::with`] from connect (no setup preamble).
+    #[test]
+    fn hkdf_over_tcp_with_op_header() {
+        let ikm: [u8; 32] = [0x5a; 32];
+        let ikm_n = [0xa1u8; 32];
+        let ikm_c = xor32(ikm_n, ikm);
+        let after_sh = [0x01; 32];
+        let after_sf = [0x02; 32];
+        let (ref_tx, _, ref_rx, _) = reference_tls13_client_traffic(&ikm, &after_sh, &after_sf);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notary_h = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_nodelay(true).unwrap();
+            Channel::with(s, |ch| {
+                let h = read_header(ch)?;
+                assert_eq!(h.op, OP_2PC_HKDF);
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+            })
+        });
+
+        let client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+        let c_shares =
+            Channel::with(client, |ch| client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf))
+                .unwrap();
+
+        let n_shares = notary_h.join().unwrap().unwrap();
+        assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
+        assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), ref_rx);
+    }
+
+    /// Mode-2 wire shape: raw host setup + second [`Channel::with`] for HKDF works
+    /// once ECDH sends a stable host scalar encoding and notary derives TLS IKM.
+    #[test]
+    fn hkdf_over_tcp_after_raw_host_preamble() {
+        use crate::ecdh::{
+            generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup, reference_ikm,
+            share_to_bytes,
+        };
+        use crate::hkdf::NotaryTrafficShares;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let notary_share = generate_share(&mut rand::thread_rng());
+        let host_share = generate_share(&mut rand::thread_rng());
+        let server_secret = StaticSecret::from([0x33u8; 32]);
+        let server_epk = *PublicKey::from(&server_secret).as_bytes();
+        let after_sh = [0x01; 32];
+        let after_sf = [0x02; 32];
+
+        const SETUP_2PC: u8 = 2;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notary_h = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_nodelay(true).unwrap();
+            Channel::with(s, |ch| -> SwankyResult<NotaryTrafficShares> {
+                let mut mode = [0u8; 1];
+                ch.read_bytes(&mut mode)?;
+                assert_eq!(mode[0], SETUP_2PC);
+                ch.write_bytes(&share_to_bytes(&notary_share))?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
+                let mut transcript = [0u8; 64];
+                ch.read_bytes(&mut transcript)?;
+                assert_eq!(&transcript[..32], &after_sh);
+                assert_eq!(&transcript[32..], &after_sf);
+                let mut io = ChannelRw(ch);
+                let outcome = notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
+                    .map_err(|e| {
+                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                    })?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+                })?;
+                let ikm_n = match outcome {
+                    crate::ecdh::EcdhSetupOutcome::Ot(o) => o.notary_ikm_share,
+                    _ => panic!("expected OT ECDH"),
+                };
+                let h = read_header(ch)?;
+                assert_eq!(h.op, OP_2PC_HKDF);
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+            })
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).unwrap();
+        stream.write_all(&[SETUP_2PC]).unwrap();
+        let mut scalar = [0u8; 32];
+        stream.read_exact(&mut scalar).unwrap();
+        assert_eq!(scalar, share_to_bytes(&notary_share));
+        stream.write_all(&after_sh).unwrap();
+        stream.write_all(&after_sf).unwrap();
+        let outcome = host_send_ecdh_ot(&mut stream, &host_share, &server_epk).unwrap();
+        stream.flush().unwrap();
+
+        let ikm_c = outcome.host_ikm_share;
+        let c_shares = Channel::with(&mut stream, |ch| {
+            client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)
+        })
+        .unwrap();
+
+        let n_shares = notary_h.join().unwrap().unwrap();
+        let ikm_full = reference_ikm(&host_share, &notary_share, &server_epk).0;
+        let (ref_tx, _, ref_rx, _) =
+            reference_tls13_client_traffic(&ikm_full, &after_sh, &after_sf);
+        assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
+        assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), ref_rx);
+    }
+
+    /// Setup bytes (no ECDH) then HKDF on one continuous channel per peer.
+    #[test]
+    fn hkdf_over_tcp_after_setup_preamble_only() {
+        let ikm_n = [0xa1u8; 32];
+        let ikm_c = [0x5eu8; 32];
+        let ikm = xor32(ikm_n, ikm_c);
+        let after_sh = [0x01; 32];
+        let after_sf = [0x02; 32];
+        const SETUP_2PC: u8 = 2;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notary_h = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_nodelay(true).unwrap();
+            Channel::with(s, |ch| {
+                let mut mode = [0u8; 1];
+                ch.read_bytes(&mut mode)?;
+                assert_eq!(mode[0], SETUP_2PC);
+                ch.write_bytes(&[0u8; 32])?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
+                let mut transcript = [0u8; 64];
+                ch.read_bytes(&mut transcript)?;
+                let h = read_header(ch)?;
+                assert_eq!(h.op, OP_2PC_HKDF);
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+            })
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let c_shares = Channel::with(stream, |ch| {
+            ch.write_bytes(&[SETUP_2PC])?;
+            let mut scalar = [0u8; 32];
+            ch.read_bytes(&mut scalar)?;
+            ch.write_bytes(&after_sh)?;
+            ch.write_bytes(&after_sf)?;
+            client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)
+        })
+        .unwrap();
+
+        let n_shares = notary_h.join().unwrap().unwrap();
+        let (ref_tx, _, ref_rx, _) = reference_tls13_client_traffic(&ikm, &after_sh, &after_sf);
+        assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
+        assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), ref_rx);
+    }
+
+    /// ECDH over channel then HKDF in-process (isolates TCP from garbling desync).
+    #[test]
+    fn hkdf_over_local_after_ecdh_on_channel() {
+        use crate::ecdh::{
+            generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup, reference_ikm,
+        };
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let notary_share = generate_share(&mut rand::thread_rng());
+        let host_share = generate_share(&mut rand::thread_rng());
+        let server_secret = StaticSecret::from([0x33u8; 32]);
+        let server_epk = *PublicKey::from(&server_secret).as_bytes();
+        let after_sh = [0x01; 32];
+        let after_sf = [0x02; 32];
+        let ikm_full = reference_ikm(&host_share, &notary_share, &server_epk).0;
+
+        let (n_result, c_result) = local_channel_pair(
+            |ch| -> SwankyResult<_> {
+                let mut io = ChannelRw(ch);
+                let outcome = notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
+                    .map_err(|e| {
+                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                    })?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
+                let ikm_n = match outcome {
+                    crate::ecdh::EcdhSetupOutcome::Ot(o) => o.notary_ikm_share,
+                    _ => panic!("expected OT ECDH"),
+                };
+                let h = read_header(ch)?;
+                assert_eq!(h.op, OP_2PC_HKDF);
+                let shares =
+                    notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)?;
+                Ok((shares, ikm_n))
+            },
+            |ch| -> SwankyResult<_> {
+                let mut io = ChannelRw(ch);
+                let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
+                    .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
+                let ikm_c = outcome.host_ikm_share;
+                let shares =
+                    client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)?;
+                Ok((shares, ikm_c))
+            },
+        )
+        .unwrap();
+        let (n_shares, notary_ikm_n) = n_result;
+        let (c_shares, host_ikm_c) = c_result;
+
+        assert_eq!(xor32(notary_ikm_n, host_ikm_c), ikm_full, "OT ECDH IKM shares");
+
+        let (ref_tx, _, ref_rx, _) =
+            reference_tls13_client_traffic(&ikm_full, &after_sh, &after_sf);
+        assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
+        assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), ref_rx);
+    }
+
+    /// After ECDH on a channel, HKDF with **fixed** IKM shares (not ECDH output).
+    #[test]
+    fn hkdf_over_local_after_ecdh_with_fixed_ikm() {
+        use crate::ecdh::{generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup};
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let notary_share = generate_share(&mut rand::thread_rng());
+        let host_share = generate_share(&mut rand::thread_rng());
+        let server_secret = StaticSecret::from([0x33u8; 32]);
+        let server_epk = *PublicKey::from(&server_secret).as_bytes();
+        let after_sh = [0x01; 32];
+        let after_sf = [0x02; 32];
+        let ikm: [u8; 32] = [0x5a; 32];
+        let ikm_n = [0xa1u8; 32];
+        let ikm_c = xor32(ikm_n, ikm);
+
+        let (n_shares, c_shares) = local_channel_pair(
+            |ch| -> SwankyResult<_> {
+                let mut io = ChannelRw(ch);
+                let _ = notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
+                    .map_err(|e| {
+                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                    })?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
+                let h = read_header(ch)?;
+                assert_eq!(h.op, OP_2PC_HKDF);
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+            },
+            |ch| -> SwankyResult<_> {
+                let mut io = ChannelRw(ch);
+                let _ = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
+                    .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
+                client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)
+            },
+        )
+        .unwrap();
+
+        let (ref_tx, _, ref_rx, _) = reference_tls13_client_traffic(&ikm, &after_sh, &after_sf);
+        assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
+        assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), ref_rx);
+    }
+
+    /// Correct mode-2 pattern: one continuous [`Channel::with`] on the host (setup + HKDF).
+    #[test]
+    fn hkdf_over_tcp_single_host_channel() {
+        use crate::ecdh::{
+            generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup, reference_ikm,
+            share_to_bytes,
+        };
+        use crate::hkdf::NotaryTrafficShares;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let notary_share = generate_share(&mut rand::thread_rng());
+        let host_share = generate_share(&mut rand::thread_rng());
+        let server_secret = StaticSecret::from([0x33u8; 32]);
+        let server_epk = *PublicKey::from(&server_secret).as_bytes();
+        let after_sh = [0x01; 32];
+        let after_sf = [0x02; 32];
+        const SETUP_2PC: u8 = 2;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notary_h = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_nodelay(true).unwrap();
+            Channel::with(s, |ch| -> SwankyResult<NotaryTrafficShares> {
+                let mut mode = [0u8; 1];
+                ch.read_bytes(&mut mode)?;
+                assert_eq!(mode[0], SETUP_2PC);
+                ch.write_bytes(&share_to_bytes(&notary_share))?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
+                let mut transcript = [0u8; 64];
+                ch.read_bytes(&mut transcript)?;
+                let mut io = ChannelRw(ch);
+                let outcome = notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
+                    .map_err(|e| {
+                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                    })?;
+                ch.force_flush().map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+                })?;
+                let ikm_n = match outcome {
+                    crate::ecdh::EcdhSetupOutcome::Ot(o) => o.notary_ikm_share,
+                    _ => panic!("expected OT ECDH"),
+                };
+                let h = read_header(ch)?;
+                assert_eq!(h.op, OP_2PC_HKDF);
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+            })
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let c_shares = Channel::with(stream, |ch| -> SwankyResult<_> {
+            ch.write_bytes(&[SETUP_2PC])?;
+            let mut scalar = [0u8; 32];
+            ch.read_bytes(&mut scalar)?;
+            ch.write_bytes(&after_sh)?;
+            ch.write_bytes(&after_sf)?;
+            let mut io = ChannelRw(ch);
+            let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
+                .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+            ch.force_flush().map_err(|e| {
+                swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+            })?;
+            client_run_2pc_traffic_hkdf(ch, outcome.host_ikm_share, after_sh, after_sf)
+        })
+        .unwrap();
+
+        let n_shares = notary_h.join().unwrap().unwrap();
+        let ikm_full = reference_ikm(&host_share, &notary_share, &server_epk).0;
+        let (ref_tx, _, ref_rx, _) =
+            reference_tls13_client_traffic(&ikm_full, &after_sh, &after_sf);
+        assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
+        assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), ref_rx);
     }
 }
 

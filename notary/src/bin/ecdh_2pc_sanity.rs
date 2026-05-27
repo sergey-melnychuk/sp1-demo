@@ -19,9 +19,9 @@ use std::net::{TcpListener, TcpStream};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use notary::ecdh::{
-    EcdhIkmDriver, LeakyAdditivePointEcdh, OtX25519Blinded, generate_share,
-    host_run_leaky_additive, host_run_ot_blinded, notary_run_leaky_additive,
-    notary_run_ot_blinded,
+    EcdhIkmDriver, EcdhSetupOutcome, LeakyAdditivePointEcdh, OtX25519Blinded, generate_share,
+    host_send_ecdh_leaky, host_send_ecdh_ot, notary_recv_ecdh_setup, share_from_bytes,
+    share_to_bytes,
 };
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -86,14 +86,17 @@ fn run_self_test(ot: bool) -> Result<()> {
                 r: n2h_r,
                 w: h2n_w,
             };
-            notary_run_ot_blinded(&k_n, &server_epk, &mut io, &mut rng)
+            match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
+                EcdhSetupOutcome::Ot(o) => o,
+                _ => panic!("expected OT ECDH"),
+            }
         });
         let mut host_io = Duplex {
             r: h2n_r,
             w: n2h_w,
         };
-        let host_out = host_run_ot_blinded(&k_c, &server_epk, &mut host_io)?;
-        let notary_out = notary.join().unwrap()?;
+        let host_out = host_send_ecdh_ot(&mut host_io, &k_c, &server_epk)?;
+        let notary_out = notary.join().unwrap();
         assert_eq!(notary_out.ikm.0, expect.0);
         assert_eq!(host_out.host_ikm_share, notary_out.host_ikm_share);
         eprintln!("self-test (OT) ok: IKM = {}", hex(&expect.0));
@@ -105,15 +108,18 @@ fn run_self_test(ot: bool) -> Result<()> {
             r: n2h_r,
             w: h2n_w,
         };
-        notary_run_leaky_additive(&k_n, &server_epk, &mut io, &mut rng)
+        match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
+            EcdhSetupOutcome::Leaky(o) => o,
+            _ => panic!("expected leaky ECDH"),
+        }
     });
 
     let mut host_io = Duplex {
         r: h2n_r,
         w: n2h_w,
     };
-    let host_out = host_run_leaky_additive(&k_c, &server_epk, &mut host_io)?;
-    let notary_out = notary.join().unwrap()?;
+    let host_out = host_send_ecdh_leaky(&mut host_io, &k_c, &k_n, &server_epk)?;
+    let notary_out = notary.join().unwrap();
 
     assert_eq!(host_out.ikm.0, expect.0);
     assert_eq!(notary_out.ikm.0, expect.0);
@@ -150,12 +156,28 @@ fn run_notary(listen: &str) -> Result<()> {
 
     let mut server_epk = [0u8; 32];
     stream.read_exact(&mut server_epk).context("read server_epk")?;
+    let host_share = share_from_bytes(
+        &{
+            let mut b = [0u8; 32];
+            stream.read_exact(&mut b).context("read host share")?;
+            b
+        },
+    );
     eprintln!("notary: server_epk = {}", hex(&server_epk));
 
     let mut rng = OsRng;
     let share = generate_share(&mut rng);
-    let out = notary_run_leaky_additive(&share, &server_epk, &mut stream, &mut rng)
-        .context("notary_run_leaky_additive")?;
+    stream
+        .write_all(&share_to_bytes(&share))
+        .context("write notary share")?;
+    let out = notary::ecdh::notary_run_leaky_additive(
+        &share,
+        &host_share,
+        &server_epk,
+        &mut stream,
+        &mut rng,
+    )
+    .context("notary_run_leaky_additive")?;
 
     eprintln!("notary: IKM            = {}", hex(&out.ikm.0));
     eprintln!("notary: IKM mask share = {}", hex(&out.notary_ikm_share));
@@ -175,7 +197,15 @@ fn run_host(connect: &str) -> Result<()> {
         .context("write server_epk")?;
 
     let k_c = generate_share(&mut rng);
-    let out = host_run_leaky_additive(&k_c, &server_epk, &mut stream)
+    stream
+        .write_all(&share_to_bytes(&k_c))
+        .context("write host share")?;
+    let mut notary_share_bytes = [0u8; 32];
+    stream
+        .read_exact(&mut notary_share_bytes)
+        .context("read notary share")?;
+    let k_n = share_from_bytes(&notary_share_bytes);
+    let out = notary::ecdh::host_run_leaky_additive(&k_c, &k_n, &server_epk, &mut stream)
         .context("host_run_leaky_additive")?;
 
     let recon: [u8; 32] =

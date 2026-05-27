@@ -209,6 +209,12 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
                     (outcome.notary_ikm_share, outcome.ikm.0)
                 }
             };
+            ch.force_flush().map_err(|e| {
+                swanky_error::swanky_error!(
+                    swanky_error::ErrorKind::NetworkError,
+                    "flush after ECDH before HKDF: {e}"
+                )
+            })?;
             Ok(SetupKeys::TwoPcPending {
                 ikm_n,
                 after_sh,

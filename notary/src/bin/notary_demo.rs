@@ -38,7 +38,7 @@ use notary::hkdf::reference_tls13_client_traffic;
 use notary::transcript::transcript_hashes_with_ikm;
 use notary::tls::{
     client_decrypt_record, client_encrypt_record, client_finish_session, client_run_2pc_traffic_hkdf,
-    tls13_aad,
+    tls13_aad, ChannelRw,
 };
 use rand::RngCore;
 use rustls::crypto::cipher::AeadKey;
@@ -146,6 +146,14 @@ impl Write for CapturingStream {
 
 fn xor_key(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
     std::array::from_fn(|i| a[i] ^ b[i])
+}
+
+fn map_io<T>(r: std::io::Result<T>) -> swanky_error::Result<T> {
+    r.map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))
+}
+
+fn map_rustls<T>(r: Result<T, rustls::Error>) -> swanky_error::Result<T> {
+    r.map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "{e}"))
 }
 
 /// Inject a pre-agreed client X25519 ephemeral into rustls (mode 1).
@@ -262,125 +270,139 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
     };
 
     eprintln!(
-        "phase 0a: connect notary for 2PC traffic setup {}",
+        "phase 0: connect notary (single Channel session) {}",
         args.notary
     );
-    let mut notary_tcp = TcpStream::connect(&args.notary)
+    let notary_tcp = TcpStream::connect(&args.notary)
         .with_context(|| format!("connect to notary {}", args.notary))?;
     notary_tcp.set_nodelay(true)?;
-    notary_tcp
-        .write_all(&[SETUP_2PC_TRAFFIC_KEYS])
-        .context("write 2PC setup mode")?;
-    notary_tcp.flush().context("flush setup mode")?;
-    let mut notary_scalar = [0u8; 32];
-    notary_tcp
-        .read_exact(&mut notary_scalar)
-        .context("read notary scalar share")?;
-    let notary_share = share_from_bytes(&notary_scalar);
-    let host_share = generate_share(&mut rand::thread_rng());
-    let esk = combined_client_esk(&host_share, &notary_share);
-    eprintln!("phase 0a: scalar share received — ClientHello uses split ephemeral");
 
-    let mut provider = make_provider(esk);
-    provider.cipher_suites =
-        vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
-    let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
+    let session_result = Channel::with(notary_tcp, |ch| -> swanky_error::Result<_> {
+        ch.write_bytes(&[SETUP_2PC_TRAFFIC_KEYS])
+            .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+        let mut notary_scalar = [0u8; 32];
+        ch.read_bytes(&mut notary_scalar)?;
+        let notary_share = share_from_bytes(&notary_scalar);
+        let host_share = generate_share(&mut rand::thread_rng());
+        let esk = combined_client_esk(&host_share, &notary_share);
+        eprintln!("phase 0a: scalar share received — ClientHello uses split ephemeral");
+
+        let mut provider = make_provider(esk);
+        provider.cipher_suites =
+            vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+        let mut config = map_rustls(
+            ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_protocol_versions(&[&rustls::version::TLS13]),
+        )?
         .with_root_certificates(rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         })
         .with_no_client_auth();
-    config.enable_secret_extraction = true;
+        config.enable_secret_extraction = true;
 
-    let server_name: rustls::pki_types::ServerName =
-        host.clone().try_into().context("invalid server name")?;
+        let server_name: rustls::pki_types::ServerName = host
+            .clone()
+            .try_into()
+            .map_err(|_| {
+                swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "invalid server name")
+            })?;
 
-    eprintln!("phase 1: TCP+TLS handshake to {host}:{port}");
-    let tcp = TcpStream::connect(format!("{host}:{port}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let mut capturing = CapturingStream::new(tcp);
-    let mut tls = ClientConnection::new(Arc::new(config), server_name)?;
-    while tls.is_handshaking() {
-        if tls.wants_write() {
-            tls.write_tls(&mut capturing).context("write handshake")?;
+        eprintln!("phase 1: TCP+TLS handshake to {host}:{port}");
+        let tcp = map_io(TcpStream::connect(format!("{host}:{port}")))?;
+        map_io(tcp.set_read_timeout(Some(Duration::from_secs(15))))?;
+        let mut capturing = CapturingStream::new(tcp);
+        let mut tls = map_rustls(ClientConnection::new(Arc::new(config), server_name))?;
+        while tls.is_handshaking() {
+            if tls.wants_write() {
+                map_io(tls.write_tls(&mut capturing))?;
+            }
+            if tls.wants_read() {
+                map_io(tls.read_tls(&mut capturing))?;
+                map_rustls(tls.process_new_packets())?;
+            }
         }
-        if tls.wants_read() {
-            tls.read_tls(&mut capturing).context("read handshake")?;
-            tls.process_new_packets().context("process handshake")?;
+        while tls.wants_write() {
+            map_io(tls.write_tls(&mut capturing))?;
         }
-    }
-    while tls.wants_write() {
-        tls.write_tls(&mut capturing).context("flush post-handshake")?;
-    }
-    capturing
-        .inner
-        .set_read_timeout(Some(Duration::from_millis(150)))?;
-    let _ = tls.read_tls(&mut capturing);
-    let _ = tls.process_new_packets();
-    while tls.wants_write() {
-        let _ = tls.write_tls(&mut capturing);
-    }
-    capturing
-        .inner
-        .set_read_timeout(Some(Duration::from_secs(15)))?;
+        map_io(
+            capturing
+                .inner
+                .set_read_timeout(Some(Duration::from_millis(150))),
+        )?;
+        let _ = tls.read_tls(&mut capturing);
+        let _ = tls.process_new_packets();
+        while tls.wants_write() {
+            let _ = tls.write_tls(&mut capturing);
+        }
+        map_io(
+            capturing
+                .inner
+                .set_read_timeout(Some(Duration::from_secs(15))),
+        )?;
 
-    let server_epk = parse_server_hello_key_share(&capturing.inbound)
-        .context("no ServerHello key_share in capture")?;
-    let ikm_oracle = reference_ikm(&host_share, &notary_share, &server_epk);
-    let (after_sh, after_sf) = transcript_hashes_with_ikm(
-        &capturing.outbound,
-        &capturing.inbound,
-        &ikm_oracle.0,
-    )
-    .context("transcript hashes")?;
-    let (_, tx_iv, _, rx_iv) =
-        reference_tls13_client_traffic(&ikm_oracle.0, &after_sh, &after_sf);
-
-    eprintln!("phase 2: 2PC traffic key path (no rustls extract for record keys)");
-    if args.verify_rustls_keys {
-        let secrets = tls.dangerous_extract_secrets().context("verify extract")?;
-        let (_, rust_tx) = secrets.tx;
-        let (_, rust_rx) = secrets.rx;
-        let (ref_tx, ref_iv_tx, ref_rx, ref_iv_rx) =
+        let server_epk = parse_server_hello_key_share(&capturing.inbound)
+            .ok_or_else(|| swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "no server epk"))?;
+        let ikm_oracle = reference_ikm(&host_share, &notary_share, &server_epk);
+        let (after_sh, after_sf) = transcript_hashes_with_ikm(
+            &capturing.outbound,
+            &capturing.inbound,
+            &ikm_oracle.0,
+        )
+        .ok_or_else(|| {
+            swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "transcript hashes")
+        })?;
+        let (_, tx_iv, _, rx_iv) =
             reference_tls13_client_traffic(&ikm_oracle.0, &after_sh, &after_sf);
-        use rustls::ConnectionTrafficSecrets;
-        match &rust_tx {
-            ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
-                assert_eq!(key.as_ref(), ref_tx.as_slice());
-                assert_eq!(iv.as_ref(), ref_iv_tx.as_slice());
+
+        eprintln!("phase 2: 2PC traffic key path (no rustls extract for record keys)");
+        if args.verify_rustls_keys {
+            let secrets = map_rustls(tls.dangerous_extract_secrets())?;
+            let (_, rust_tx) = secrets.tx;
+            let (_, rust_rx) = secrets.rx;
+            let (ref_tx, ref_iv_tx, ref_rx, ref_iv_rx) =
+                reference_tls13_client_traffic(&ikm_oracle.0, &after_sh, &after_sf);
+            use rustls::ConnectionTrafficSecrets;
+            match &rust_tx {
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
+                    assert_eq!(key.as_ref(), ref_tx.as_slice());
+                    assert_eq!(iv.as_ref(), ref_iv_tx.as_slice());
+                }
+                _ => swanky_error::bail!(
+                    swanky_error::ErrorKind::OtherError,
+                    "expected AES-128-GCM tx secrets"
+                ),
             }
-            _ => bail!("expected AES-128-GCM tx secrets"),
-        }
-        match &rust_rx {
-            ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
-                assert_eq!(key.as_ref(), ref_rx.as_slice());
-                assert_eq!(iv.as_ref(), ref_iv_rx.as_slice());
+            match &rust_rx {
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
+                    assert_eq!(key.as_ref(), ref_rx.as_slice());
+                    assert_eq!(iv.as_ref(), ref_iv_rx.as_slice());
+                }
+                _ => swanky_error::bail!(
+                    swanky_error::ErrorKind::OtherError,
+                    "expected AES-128-GCM rx secrets"
+                ),
             }
-            _ => bail!("expected AES-128-GCM rx secrets"),
+            eprintln!("phase 2: rustls extract matches reference key schedule");
         }
-        eprintln!("phase 2: rustls extract matches reference key schedule");
-    }
 
-    eprintln!("phase 3: transcript + OT ECDH to notary at {}", args.notary);
-    notary_tcp
-        .write_all(&after_sh)
-        .context("write transcript after_sh")?;
-    notary_tcp
-        .write_all(&after_sf)
-        .context("write transcript after_sf")?;
-    let outcome = host_send_ecdh_ot(&mut notary_tcp, &host_share, &server_epk)
-        .context("OT ECDH wire")?;
-    notary_tcp.flush().context("flush OT ECDH")?;
-    eprintln!(
-        "phase 3b: host XOR IKM share={} (2PC HKDF next)",
-        hex_encode(&outcome.host_ikm_share)
-    );
+        eprintln!("phase 3: transcript + OT ECDH on notary channel");
+        ch.write_bytes(&after_sh)?;
+        ch.write_bytes(&after_sf)?;
+        let mut io = ChannelRw(ch);
+        let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
+            .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+        ch.force_flush().map_err(|e| {
+            swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+        })?;
+        eprintln!(
+            "phase 3b: host XOR IKM share={} (2PC HKDF next)",
+            hex_encode(&outcome.host_ikm_share)
+        );
 
-    let mut raw_outbound = capturing.outbound;
-    let mut raw_inbound = capturing.inbound;
-    let mut tcp = capturing.inner;
+        let mut raw_outbound = capturing.outbound;
+        let mut raw_inbound = capturing.inbound;
+        let mut tcp = capturing.inner;
 
-    let session_result = Channel::with(&mut notary_tcp, |ch| -> swanky_error::Result<_> {
         eprintln!("phase 4a: 2PC HKDF traffic key schedule (OP_2PC_HKDF)");
         let traffic =
             client_run_2pc_traffic_hkdf(ch, outcome.host_ikm_share, after_sh, after_sf)?;
@@ -494,6 +516,7 @@ fn run_legacy_demo(args: Args) -> Result<()> {
     let mut k_n_rx = [0u8; 16];
     let mut notary_pre_tls: Option<TcpStream> = None;
     let mut host_ecdh_share: Option<EphemeralShare> = None;
+    let mut notary_ecdh_share: Option<EphemeralShare> = None;
 
     let mut provider = if args.legacy_host_xor_masks {
         rustls::crypto::ring::default_provider()
@@ -523,6 +546,7 @@ fn run_legacy_demo(args: Args) -> Result<()> {
         let notary_share = share_from_bytes(&notary_scalar);
         let host_share = generate_share(&mut rand::thread_rng());
         host_ecdh_share = Some(host_share);
+        notary_ecdh_share = Some(notary_share);
         let esk = combined_client_esk(&host_share, &notary_share);
         provider = make_provider(esk);
         provider.cipher_suites =
@@ -613,8 +637,11 @@ fn run_legacy_demo(args: Args) -> Result<()> {
                     .context("mode 1 requires host ECDH share from phase 0a")?;
                 if args.leaky_ecdh_wire {
                     eprintln!("phase 3b: leaky additive ECDH (debug — cleartext partials)");
-                    let outcome =
-                        host_send_ecdh_leaky(&mut nm, host_share, &epk).context("leaky ECDH wire")?;
+                    let notary_share = notary_ecdh_share
+                        .as_ref()
+                        .context("mode 1 requires notary ECDH share from phase 0a")?;
+                    let outcome = host_send_ecdh_leaky(&mut nm, host_share, notary_share, &epk)
+                        .context("leaky ECDH wire")?;
                     nm.flush().context("flush leaky ECDH")?;
                     eprintln!(
                         "phase 3b: host-side IKM={} (both parties learn full IKM)",

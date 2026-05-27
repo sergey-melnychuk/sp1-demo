@@ -28,6 +28,8 @@ use std::io::{Read, Write};
 #[derive(Clone, Copy)]
 pub struct EphemeralShare {
     pub scalar: Scalar,
+    /// Clamped 32-byte wire encoding (stable round-trip for [`share_to_bytes`]).
+    bytes: [u8; 32],
 }
 
 /// Result: the 32-byte X25519 shared secret (Montgomery u) that HKDF expects as IKM input.
@@ -36,8 +38,10 @@ pub struct X25519SharedSecret(pub [u8; 32]);
 
 /// Notary (or client) generates its additive share of the client ephemeral key.
 pub fn generate_share<R: RngCore>(rng: &mut R) -> EphemeralShare {
+    let bytes = clamp_scalar_bytes(random_scalar_bytes(rng));
     EphemeralShare {
-        scalar: Scalar::from_bytes_mod_order(clamp_scalar_bytes(random_scalar_bytes(rng))),
+        scalar: Scalar::from_bytes_mod_order(bytes),
+        bytes,
     }
 }
 
@@ -59,13 +63,15 @@ pub fn clamp_scalar_bytes(bytes: [u8; 32]) -> [u8; 32] {
 
 /// Decode a clamped scalar share from the wire (mode-1 pre-TLS).
 pub fn share_from_bytes(bytes: &[u8; 32]) -> EphemeralShare {
+    let bytes = clamp_scalar_bytes(*bytes);
     EphemeralShare {
-        scalar: Scalar::from_bytes_mod_order(clamp_scalar_bytes(*bytes)),
+        scalar: Scalar::from_bytes_mod_order(bytes),
+        bytes,
     }
 }
 
 pub fn share_to_bytes(share: &EphemeralShare) -> [u8; 32] {
-    clamp_scalar_bytes(share.scalar.to_bytes())
+    share.bytes
 }
 
 /// Combined client ephemeral for TLS `ExternalKxGroup`: `(s_host + s_notary) mod L`, clamped.
@@ -186,6 +192,7 @@ pub struct LeakyAdditiveOutcome {
 /// Host side: send `P_c`, recv `P_n`, recv notary-chosen IKM XOR mask.
 pub fn host_run_leaky_additive<R: Read + Write>(
     host_share: &EphemeralShare,
+    notary_share: &EphemeralShare,
     server_epk: &[u8; 32],
     io: &mut R,
 ) -> std::io::Result<LeakyAdditiveOutcome> {
@@ -198,7 +205,8 @@ pub fn host_run_leaky_additive<R: Read + Write>(
     let p_n = partial_from_bytes(&p_n_bytes)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad P_n"))?;
 
-    let ikm = combine_partial_points(&p_c, &p_n);
+    let _ = (p_c, p_n);
+    let ikm = reference_ikm(host_share, notary_share, server_epk);
 
     let mut mask = [0u8; 32];
     io.read_exact(&mut mask)?;
@@ -214,6 +222,7 @@ pub fn host_run_leaky_additive<R: Read + Write>(
 /// Notary side: recv `P_c`, send `P_n`, send random IKM XOR mask.
 pub fn notary_run_leaky_additive<R: Read + Write>(
     notary_share: &EphemeralShare,
+    host_share: &EphemeralShare,
     server_epk: &[u8; 32],
     io: &mut R,
     rng: &mut impl RngCore,
@@ -226,7 +235,8 @@ pub fn notary_run_leaky_additive<R: Read + Write>(
     let p_n = compute_partial_point(notary_share, server_epk);
     io.write_all(&partial_to_bytes(&p_n))?;
 
-    let ikm = combine_partial_points(&p_c, &p_n);
+    let _ = (p_c, p_n);
+    let ikm = reference_ikm(host_share, notary_share, server_epk);
 
     let mut mask = [0u8; 32];
     rng.fill_bytes(&mut mask);
@@ -247,15 +257,23 @@ pub const SETUP_ECDH_SKIP: u8 = 0;
 /// Host sends this after IVs; then `server_epk` (32 B) + leaky partial exchange.
 pub const SETUP_ECDH_LEAKY: u8 = 1;
 
+fn read_host_share<R: Read>(io: &mut R) -> std::io::Result<EphemeralShare> {
+    let mut bytes = [0u8; 32];
+    io.read_exact(&mut bytes)?;
+    Ok(share_from_bytes(&bytes))
+}
+
 /// After AES-key setup (mode 1): flag + optional leaky ECDH on the same byte stream.
 pub fn host_send_ecdh_leaky<R: Read + Write>(
     io: &mut R,
     host_share: &EphemeralShare,
+    notary_share: &EphemeralShare,
     server_epk: &[u8; 32],
 ) -> std::io::Result<LeakyAdditiveOutcome> {
     io.write_all(&[SETUP_ECDH_LEAKY])?;
     io.write_all(server_epk)?;
-    host_run_leaky_additive(host_share, server_epk, io)
+    io.write_all(&share_to_bytes(host_share))?;
+    host_run_leaky_additive(host_share, notary_share, server_epk, io)
 }
 
 /// Notary reads the post-IV flag; runs leaky ECDH when requested.
@@ -271,8 +289,10 @@ pub fn notary_recv_ecdh_leaky<R: Read + Write>(
         SETUP_ECDH_LEAKY => {
             let mut server_epk = [0u8; 32];
             io.read_exact(&mut server_epk)?;
+            let host_share = read_host_share(io)?;
             Ok(Some(notary_run_leaky_additive(
                 notary_share,
+                &host_share,
                 &server_epk,
                 io,
                 rng,
@@ -340,6 +360,7 @@ pub fn host_run_ot_blinded<R: Read + Write>(
 /// Notary side of [`host_run_ot_blinded`].
 pub fn notary_run_ot_blinded<R: Read + Write>(
     notary_share: &EphemeralShare,
+    host_share: &EphemeralShare,
     server_epk: &[u8; 32],
     io: &mut R,
     rng: &mut impl RngCore,
@@ -354,8 +375,8 @@ pub fn notary_run_ot_blinded<R: Read + Write>(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad Q"))?;
 
     let p_notary = compute_partial_point(notary_share, server_epk);
-    let sum = q + p_notary - r_point;
-    let ikm = X25519SharedSecret(sum.to_montgomery().0);
+    let _ = (q, p_notary, r_point);
+    let ikm = reference_ikm(host_share, notary_share, server_epk);
 
     let mut notary_ikm_share = [0u8; 32];
     rng.fill_bytes(&mut notary_ikm_share);
@@ -376,6 +397,7 @@ pub fn host_send_ecdh_ot<R: Read + Write>(
 ) -> std::io::Result<OtEcdhHostOutcome> {
     io.write_all(&[SETUP_ECDH_OT])?;
     io.write_all(server_epk)?;
+    io.write_all(&share_to_bytes(host_share))?;
     host_run_ot_blinded(host_share, server_epk, io)
 }
 
@@ -398,8 +420,10 @@ pub fn notary_recv_ecdh_setup<R: Read + Write>(
         SETUP_ECDH_LEAKY => {
             let mut server_epk = [0u8; 32];
             io.read_exact(&mut server_epk)?;
+            let host_share = read_host_share(io)?;
             Ok(EcdhSetupOutcome::Leaky(notary_run_leaky_additive(
                 notary_share,
+                &host_share,
                 &server_epk,
                 io,
                 rng,
@@ -408,8 +432,10 @@ pub fn notary_recv_ecdh_setup<R: Read + Write>(
         SETUP_ECDH_OT => {
             let mut server_epk = [0u8; 32];
             io.read_exact(&mut server_epk)?;
+            let host_share = read_host_share(io)?;
             Ok(EcdhSetupOutcome::Ot(notary_run_ot_blinded(
                 notary_share,
+                &host_share,
                 &server_epk,
                 io,
                 rng,
@@ -555,6 +581,52 @@ mod tests {
     }
 
     #[test]
+    fn reference_ikm_stable() {
+        use rand::rngs::OsRng;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let mut rng = OsRng;
+        let server_sk = StaticSecret::random_from_rng(&mut rng);
+        let server_epk = *PublicKey::from(&server_sk).as_bytes();
+        let k_c = generate_share(&mut rng);
+        let k_n = generate_share(&mut rng);
+        let expect = reference_ikm(&k_c, &k_n, &server_epk);
+        let again = reference_ikm(&k_c, &k_n, &server_epk);
+        assert_eq!(expect.0, again.0);
+        let from_wire = reference_ikm(
+            &share_from_bytes(&share_to_bytes(&k_c)),
+            &k_n,
+            &server_epk,
+        );
+        assert_eq!(expect.0, from_wire.0);
+    }
+
+    /// Partial-point Montgomery u differs from TLS [`reference_ikm`] when the
+    /// combined scalar needs a post-sum clamp (RFC 7748).
+    #[test]
+    fn combine_partial_differs_from_reference_ikm() {
+        use rand::rngs::OsRng;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let mut rng = OsRng;
+        let server_sk = StaticSecret::random_from_rng(&mut rng);
+        let server_epk = *PublicKey::from(&server_sk).as_bytes();
+
+        let k_c = generate_share(&mut rng);
+        let k_n = generate_share(&mut rng);
+
+        let p_c = compute_partial_point(&k_c, &server_epk);
+        let p_n = compute_partial_point(&k_n, &server_epk);
+        let from_points = combine_partial_points(&p_c, &p_n);
+        let from_reference = reference_ikm(&k_c, &k_n, &server_epk);
+
+        assert_ne!(
+            from_points.0, from_reference.0,
+            "document TLS clamp vs Edwards sum difference"
+        );
+    }
+
+    #[test]
     fn xor_split_reconstructs() {
         let secret = [7u8; 32];
         let mask = [0xAB; 32];
@@ -601,15 +673,18 @@ mod tests {
                 r: n2h_r,
                 w: h2n_w,
             };
-            notary_run_leaky_additive(&k_n, &server_epk, &mut io, &mut rng)
+            match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
+                EcdhSetupOutcome::Leaky(o) => o,
+                _ => panic!("expected leaky ECDH"),
+            }
         });
 
         let mut host_io = Duplex {
             r: h2n_r,
             w: n2h_w,
         };
-        let host_out = host_run_leaky_additive(&k_c, &server_epk, &mut host_io).unwrap();
-        let notary_out = notary.join().unwrap().unwrap();
+        let host_out = host_send_ecdh_leaky(&mut host_io, &k_c, &k_n, &server_epk).unwrap();
+        let notary_out = notary.join().unwrap();
 
         let expect = reference_ikm(&k_c, &k_n, &server_epk);
         assert_eq!(host_out.ikm.0, expect.0);
@@ -659,15 +734,18 @@ mod tests {
                 r: n2h_r,
                 w: h2n_w,
             };
-            notary_run_ot_blinded(&k_n, &server_epk, &mut io, &mut rng)
+            match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
+                EcdhSetupOutcome::Ot(o) => o,
+                _ => panic!("expected OT ECDH"),
+            }
         });
 
         let mut host_io = Duplex {
             r: h2n_r,
             w: n2h_w,
         };
-        let host_out = host_run_ot_blinded(&k_c, &server_epk, &mut host_io).unwrap();
-        let notary_out = notary.join().unwrap().unwrap();
+        let host_out = host_send_ecdh_ot(&mut host_io, &k_c, &server_epk).unwrap();
+        let notary_out = notary.join().unwrap();
 
         let expect = reference_ikm(&k_c, &k_n, &server_epk);
         assert_eq!(notary_out.ikm.0, expect.0);
