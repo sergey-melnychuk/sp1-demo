@@ -31,7 +31,7 @@ Docs: [`DEMO.md`](DEMO.md), ECDH wire: [`ECDH.md`](ECDH.md).
 - **`tls.rs`** — record bridge, attested worker, `OP_2PC_HKDF`.
 - **`common::NotaryBundle`** — v0 legacy + **v1 `SessionBinding`** in signature.
 - **`notary_verify`** — standalone bundle + optional witness cross-check.
-- **`garble.rs`** — WRK17 `SplitSharedInputMaskCircuit`; HKDF compress wired; AES pending.
+- **`garble.rs`** — WRK17 helpers + `SplitSharedInputMaskCircuit`; HKDF + per-block AES wired.
 
 ### Tests
 
@@ -48,7 +48,7 @@ Three structural issues block third-party or malicious-security claims:
 |-----|--------|----------------|
 | **Host-side handshake parser** | **Fixed (mode 2):** host sends raw bytes; notary verifies in `handshake.rs`. Host still uses local `reference_ikm` for optional rustls cross-check only. | Malicious host cannot lie about transcript for mode 2 HKDF binding. |
 | **Trusted-notary semantics** | Bundle v1 signs `SessionBinding` (cert hash, transcript root, epk, circuit IDs). `notary_verify` + guest checks. Notary still learns full IKM. | Verifier can check signature + witness fields; not full MPC secrecy. |
-| **Semi-honest garbling** | HKDF compress uses **WRK17** (`garble.rs`, `SplitSharedInputMaskCircuit`). AES-GCM still `swanky-twopac` semi-honest. | Malicious garbler can cheat on record layer until AES WRK17 lands. |
+| **Semi-honest garbling** | HKDF + AES blocks use **WRK17**; GHASH (AND gates) stays semi-honest in one session per encrypt/decrypt. | Malicious garbler can still cheat on GHASH until that moves to WRK17. |
 
 ### Rationale
 
@@ -94,13 +94,12 @@ OT-MtA ECDH + incremental 2PC schedule   (remove host scalar leak + notary full 
 
 **2PC path (B):** OT-MtA, drop `ikm_full`, incremental schedule — unchanged.
 
-#### 3. Semi-honest garbling — **HKDF done; AES in progress**
+#### 3. Semi-honest garbling — **HKDF + AES blocks done; GHASH semi-honest**
 
-- **Done:** per-compress HMAC sessions; WRK17 compress with split garbler/evaluator
-  inputs + in-circuit output mask (`hkdf::sha256_compress_2pc_auth_round_matches_reference`).
-- **Next:** AES-GCM — split GHASH (semi-honest) from per-block AES WRK17 sessions.
+- **Done:** per-compress HMAC sessions (WRK17); per-block AES (WRK17) with semi-honest GHASH.
+- **Next:** WRK17 GHASH (optional; AND-heavy, one session per record today).
 
-**Minimum “production-ish” bar:** items 1 + witness 2 **done**; item 3 **HKDF done**.
+**Minimum “production-ish” bar:** items 1 + witness 2 **done**; item 3 **HKDF + AES blocks done**.
 
 ---
 
@@ -118,12 +117,11 @@ shares (~1500–2000 LOC; no swanky primitive — see `mpz`). Until then:
 - Mode 1: host briefly holds full AES keys between extract and `zeroize()`.
 - Mode 2: host never extracts record keys, but still knows full IKM locally for transcript parsing.
 
-### 2. Authenticated garbling *(HKDF done; AES in progress)*
+### 2. Authenticated garbling *(HKDF + AES blocks done; GHASH semi-honest)*
 
-`swanky-authenticated-garbling` (WRK17) for HKDF SHA-256 compress in mode 2.
-`SplitSharedInputMaskCircuit` in `garble.rs` — one auth share per input wire,
-in-circuit XOR of party shares + output mask. AES-GCM still uses one semi-honest
-garbler for GHASH + multiple AES `execute` calls.
+`swanky-authenticated-garbling` (WRK17) for HKDF compress and each AES-128 block in
+GCM. `SplitSharedInputMaskCircuit` + `wrk17_*_masked_run` in `garble.rs`. GHASH
+(128×128 AND mul) remains on one semi-honest garbler/evaluator pair per encrypt/decrypt.
 
 ### 3. Signed attestation *(witness path — done for v1)*
 
@@ -203,7 +201,7 @@ Not started.
 
 If treating this as a roadmap toward a real product:
 
-1. **WRK17 AES-GCM** — per-block auth sessions; semi-honest GHASH (#2 completion).
+1. **WRK17 GHASH** (optional) or OT-MtA ECDH (#1 completion).
 2. **OT-MtA ECDH + incremental 2PC schedule** — true split IKM (#1 completion).
 3. **Selective disclosure** — privacy upside (#5).
 4. Performance (#9–#10) + operational (#11–#15).

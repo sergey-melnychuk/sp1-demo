@@ -39,14 +39,14 @@ fn print_binding(b: &SessionBinding) {
     println!("  key_schedule_context_hash:  {}", hex(&b.key_schedule_context_hash));
     println!("  circuit_aes_sha256:         {}", hex(&b.circuit_aes_sha256));
     println!("  circuit_sha256_compress:    {}", hex(&b.circuit_sha256_compress_sha256));
+    let mode_label = match b.garbling_mode {
+        2 => "WRK17 HKDF+AES (GHASH semi-honest)",
+        1 => "WRK17 HKDF only",
+        _ => "legacy/semi-honest",
+    };
     println!(
         "  garbling_mode:              {} ({})",
-        b.garbling_mode,
-        if b.garbling_mode == 1 {
-            "authenticated"
-        } else {
-            "legacy/semi-honest"
-        }
+        b.garbling_mode, mode_label
     );
 }
 

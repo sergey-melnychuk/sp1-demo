@@ -33,9 +33,9 @@ schedule (public on the notary side). The host never calls
 `dangerous_extract_secrets()` for record-layer keys (unless `--verify-rustls-keys`
 is set for a debug cross-check).
 
-> **Honesty limits:** WRK17 authenticated garbling for **HKDF compress** (mode 2);
-> AES-GCM record layer is still semi-honest. The notary is still trusted (learns full
-> IKM on the OT path, holds public IVs). Full OT-MtA X25519 is not implemented.
+> **Honesty limits:** WRK17 for **HKDF compress** and **AES blocks** (mode 2);
+> GHASH stays semi-honest. The notary is still trusted (learns full IKM on the OT
+> path, holds public IVs). Full OT-MtA X25519 is not implemented.
 
 ## Quick start
 
@@ -181,13 +181,13 @@ See [`ECDH.md`](ECDH.md) for ECDH framing.
 - Raw handshake bytes to notary + independent transcript verify (`handshake.rs`)
 - Signed bundle v1 with `SessionBinding` + `notary_verify` CLI
 - Mode 2 2PC HKDF without host extract for record keys
-- **WRK17 authenticated garbling for HKDF SHA-256 compress** (`garble.rs` +
-  `hkdf` per-compress sessions; `garbling_mode = GARBLING_HKDF_AUTH` in bundle)
+- **WRK17 authenticated garbling for HKDF compress + AES blocks** (`garble.rs`,
+  `aes.rs`; `garbling_mode = GARBLING_GCM_AES_AUTH` (2) in bundle)
+- Semi-honest GHASH within each encrypt/decrypt (one session per record op)
 
 **Not yet:**
 
-- WRK17 on AES-GCM record layer (semi-honest today)
-- Full OT-MtA X25519; host still uses local `reference_ikm` for optional rustls cross-check
+- WRK17 GHASH; full OT-MtA X25519
 - GCM tag inside circuit; OT amortization per session
 
 See [`TODO.md`](TODO.md) for the full gap list.

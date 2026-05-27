@@ -9,22 +9,27 @@
 //! inputs, XOR pairs in-circuit, then XOR output with garbler mask inputs.
 //!
 //! **Status:**
-//! - Semi-honest per-compress HMAC chaining works (`hkdf::notary_sha256_compress_xor`).
-//! - WRK17 per-compress round uses split-input + in-circuit mask (`hkdf` auth path).
-//! - AES-GCM record layer still uses one semi-honest garbler for GHASH + multiple
-//!   `execute` calls; needs split before full WRK17 there.
+//! - WRK17 per-compress HMAC (`hkdf`).
+//! - WRK17 per-block AES + semi-honest GHASH for AES-GCM (`aes`).
 
 pub use swanky_authenticated_garbling::{Evaluator, Garbler};
 
 use fancy_garbling::circuit::{BinaryCircuit, CircuitExecutor};
 use fancy_garbling::{Fancy, FancyBinary};
+use rand::Rng;
 use sp1_demo_common::SessionBinding;
 use swanky_channel::Channel;
 use swanky_error::Result as SwankyResult;
+use swanky_rng::SwankyRng;
 
 use crate::circuits::{
-    GARBLING_HKDF_AUTH, circuit_aes_sha256, circuit_sha256_compress_sha256,
+    GARBLING_GCM_AES_AUTH, circuit_aes_sha256, circuit_sha256_compress_sha256,
 };
+
+/// AES block + key inputs (128 + 128 bits).
+pub const AES_SHARED_INPUTS: usize = 256;
+/// AES block output width.
+pub const AES_OUTPUT_BITS: usize = 128;
 
 /// Output XOR-mask width for SHA-256 compress (256-bit digest).
 pub const OUTPUT_MASK_BITS: usize = 256;
@@ -57,6 +62,14 @@ impl SplitSharedInputMaskCircuit {
 
     pub fn evaluator_inputs(&self) -> usize {
         self.shared_inputs + self.mask_bits
+    }
+
+    pub fn mask_bits(&self) -> usize {
+        self.mask_bits
+    }
+
+    pub fn shared_inputs(&self) -> usize {
+        self.shared_inputs
     }
 }
 
@@ -105,12 +118,118 @@ where
     }
 }
 
+fn bits_to_bytes<const N: usize>(bits: &[u16]) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (i, chunk) in bits.chunks(8).enumerate().take(N) {
+        for (j, &bit) in chunk.iter().enumerate() {
+            out[i] |= (bit as u8) << (7 - j);
+        }
+    }
+    out
+}
+
+/// One WRK17 garbler session: garbler region = shared-input XOR-shares + random output mask.
+/// Returns the garbler's byte-share of the masked output (the mask `m_n`).
+pub fn wrk17_notary_masked_run(
+    channel: &mut Channel,
+    circ: &SplitSharedInputMaskCircuit,
+    garbler_shared_bits: &[u16],
+) -> SwankyResult<Vec<u8>> {
+    debug_assert_eq!(garbler_shared_bits.len(), circ.shared_inputs);
+    let mask_bytes = circ.mask_bits() / 8;
+    let mut mask = vec![0u8; mask_bytes];
+    rand::thread_rng().fill(&mut mask[..]);
+
+    let mut gb_vals = garbler_shared_bits.to_vec();
+    for &b in &mask {
+        for i in (0..8u8).rev() {
+            gb_vals.push(((b >> i) & 1) as u16);
+        }
+    }
+
+    let rng = SwankyRng::new();
+    let mut gb = Garbler::new(circ, channel, rng)?;
+    let mine = gb.encode_many(&gb_vals, &vec![2u16; circ.garbler_inputs()], channel)?;
+    let theirs = gb.receive_many(&vec![2u16; circ.evaluator_inputs()], channel)?;
+    let mut inputs = mine;
+    inputs.extend(theirs);
+    let out = circ.execute(&mut gb, &inputs, channel)?;
+    gb.outputs(&out, channel)?;
+    Ok(mask)
+}
+
+/// One WRK17 evaluator session; returns the evaluator's byte-share of the masked output.
+pub fn wrk17_client_masked_run(
+    channel: &mut Channel,
+    circ: &SplitSharedInputMaskCircuit,
+    evaluator_shared_bits: &[u16],
+) -> SwankyResult<Vec<u8>> {
+    debug_assert_eq!(evaluator_shared_bits.len(), circ.shared_inputs);
+    let mut ev_vals = evaluator_shared_bits.to_vec();
+    ev_vals.extend(vec![0u16; circ.mask_bits()]);
+
+    let mut rng = SwankyRng::new();
+    let mut ev = Evaluator::new(circ, channel, &mut rng)?;
+    let notary = ev.receive_many(&vec![2u16; circ.garbler_inputs()], channel)?;
+    let mine = ev.encode_many(&ev_vals, &vec![2u16; circ.evaluator_inputs()], channel)?;
+    let mut inputs = notary;
+    inputs.extend(mine);
+    let out = circ.execute(&mut ev, &inputs, channel)?;
+    let vals = ev
+        .outputs(&out, channel)?
+        .expect("WRK17 evaluator receives circuit output");
+    let full = bits_to_bytes::<32>(&vals);
+    Ok(full[..circ.mask_bits() / 8].to_vec())
+}
+
+/// Import a byte XOR-share into a semi-honest garbler session wire bundle.
+pub fn semi_gb_split_bytes<F: FancyBinary>(
+    gb: &mut F,
+    channel: &mut Channel,
+    notary_share: &[u8],
+) -> SwankyResult<Vec<F::Item>> {
+    let bits: Vec<u16> = notary_share
+        .iter()
+        .flat_map(|&b| (0..8u8).rev().map(move |i| ((b >> i) & 1) as u16))
+        .collect();
+    let n = bits.len();
+    let mod2 = vec![2u16; n];
+    let notary_wires = gb.encode_many(&bits, &mod2, channel)?;
+    let client_wires = gb.receive_many(&mod2, channel)?;
+    Ok(notary_wires
+        .iter()
+        .zip(client_wires.iter())
+        .map(|(a, b)| gb.xor(a, b))
+        .collect())
+}
+
+/// Import a byte XOR-share into a semi-honest evaluator session wire bundle.
+pub fn semi_ev_split_bytes<F: FancyBinary>(
+    ev: &mut F,
+    channel: &mut Channel,
+    client_share: &[u8],
+) -> SwankyResult<Vec<F::Item>> {
+    let bits: Vec<u16> = client_share
+        .iter()
+        .flat_map(|&b| (0..8u8).rev().map(move |i| ((b >> i) & 1) as u16))
+        .collect();
+    let n = bits.len();
+    let mod2 = vec![2u16; n];
+    let notary_wires = ev.receive_many(&mod2, channel)?;
+    let client_wires = ev.encode_many(&bits, &mod2, channel)?;
+    Ok(notary_wires
+        .iter()
+        .zip(client_wires.iter())
+        .map(|(a, b)| ev.xor(a, b))
+        .collect())
+}
+
 /// Default binding fields for circuit identity + garbling mode.
 pub fn production_session_binding() -> SessionBinding {
     SessionBinding {
         circuit_aes_sha256: circuit_aes_sha256(),
         circuit_sha256_compress_sha256: circuit_sha256_compress_sha256(),
-        garbling_mode: GARBLING_HKDF_AUTH,
+        garbling_mode: GARBLING_GCM_AES_AUTH,
         ..SessionBinding::default()
     }
 }

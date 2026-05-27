@@ -976,7 +976,7 @@ mod tests {
         );
         assert_eq!(
             client_bundle.binding.garbling_mode,
-            crate::circuits::GARBLING_HKDF_AUTH
+            crate::circuits::GARBLING_GCM_AES_AUTH
         );
 
         // Tampering breaks verification
