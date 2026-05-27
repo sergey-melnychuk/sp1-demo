@@ -53,7 +53,7 @@ fn run_self_test(ot: bool) -> Result<()> {
     use std::io::{Read, Write};
 
     let mut rng = OsRng;
-    let server_sk = StaticSecret::random_from_rng(&mut rng);
+    let server_sk = StaticSecret::random_from_rng(rng);
     let server_epk = *PublicKey::from(&server_sk).as_bytes();
     let k_c = generate_share(&mut rng);
     let k_n = generate_share(&mut rng);
@@ -82,19 +82,13 @@ fn run_self_test(ot: bool) -> Result<()> {
 
     if ot {
         let notary = std::thread::spawn(move || {
-            let mut io = Duplex {
-                r: n2h_r,
-                w: h2n_w,
-            };
+            let mut io = Duplex { r: n2h_r, w: h2n_w };
             match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
                 EcdhSetupOutcome::Ot(o) => o,
                 _ => panic!("expected OT ECDH"),
             }
         });
-        let mut host_io = Duplex {
-            r: h2n_r,
-            w: n2h_w,
-        };
+        let mut host_io = Duplex { r: h2n_r, w: n2h_w };
         let host_out = host_send_ecdh_ot(&mut host_io, &k_c, &server_epk)?;
         let notary_out = notary.join().unwrap();
         assert_eq!(notary_out.ikm.0, expect.0);
@@ -104,20 +98,14 @@ fn run_self_test(ot: bool) -> Result<()> {
     }
 
     let notary = std::thread::spawn(move || {
-        let mut io = Duplex {
-            r: n2h_r,
-            w: h2n_w,
-        };
+        let mut io = Duplex { r: n2h_r, w: h2n_w };
         match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
             EcdhSetupOutcome::Leaky(o) => o,
             _ => panic!("expected leaky ECDH"),
         }
     });
 
-    let mut host_io = Duplex {
-        r: h2n_r,
-        w: n2h_w,
-    };
+    let mut host_io = Duplex { r: h2n_r, w: n2h_w };
     let host_out = host_send_ecdh_leaky(&mut host_io, &k_c, &k_n, &server_epk)?;
     let notary_out = notary.join().unwrap();
 
@@ -155,14 +143,14 @@ fn run_notary(listen: &str) -> Result<()> {
     stream.set_nodelay(true)?;
 
     let mut server_epk = [0u8; 32];
-    stream.read_exact(&mut server_epk).context("read server_epk")?;
-    let host_share = share_from_bytes(
-        &{
-            let mut b = [0u8; 32];
-            stream.read_exact(&mut b).context("read host share")?;
-            b
-        },
-    );
+    stream
+        .read_exact(&mut server_epk)
+        .context("read server_epk")?;
+    let host_share = share_from_bytes(&{
+        let mut b = [0u8; 32];
+        stream.read_exact(&mut b).context("read host share")?;
+        b
+    });
     eprintln!("notary: server_epk = {}", hex(&server_epk));
 
     let mut rng = OsRng;
@@ -190,11 +178,9 @@ fn run_host(connect: &str) -> Result<()> {
 
     let mut rng = OsRng;
     // Simulated TLS server ephemeral (host knows server_epk; notary learns it on the wire).
-    let server_sk = StaticSecret::random_from_rng(&mut rng);
+    let server_sk = StaticSecret::random_from_rng(rng);
     let server_epk = *PublicKey::from(&server_sk).as_bytes();
-    stream
-        .write_all(&server_epk)
-        .context("write server_epk")?;
+    stream.write_all(&server_epk).context("write server_epk")?;
 
     let k_c = generate_share(&mut rng);
     stream
@@ -208,8 +194,7 @@ fn run_host(connect: &str) -> Result<()> {
     let out = notary::ecdh::host_run_leaky_additive(&k_c, &k_n, &server_epk, &mut stream)
         .context("host_run_leaky_additive")?;
 
-    let recon: [u8; 32] =
-        std::array::from_fn(|i| out.host_ikm_share[i] ^ out.notary_ikm_share[i]);
+    let recon: [u8; 32] = std::array::from_fn(|i| out.host_ikm_share[i] ^ out.notary_ikm_share[i]);
     assert_eq!(recon, out.ikm.0, "XOR IKM shares must reconstruct IKM");
 
     eprintln!("host: IKM            = {}", hex(&out.ikm.0));

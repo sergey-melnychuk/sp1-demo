@@ -33,7 +33,8 @@ path = "src/bin/notary_verify.rs"
 sp1-demo-common         = { path = "../common" }
 fancy-garbling          = { git = "https://github.com/GaloisInc/swanky", package = "fancy-garbling" }
 swanky-twopac           = { git = "https://github.com/GaloisInc/swanky", package = "swanky-twopac" }
-swanky-authenticated-garbling = { git = "https://github.com/GaloisInc/swanky", package = "swanky-authenticated-garbling" }
+swanky-authenticated-garbling = { path = "deps/swanky-authenticated-garbling" }
+swanky-authenticated-bits   = { git = "https://github.com/GaloisInc/swanky", package = "swanky-authenticated-bits" }
 swanky-channel          = { git = "https://github.com/GaloisInc/swanky", package = "swanky-channel" }
 swanky-rng              = { git = "https://github.com/GaloisInc/swanky", package = "swanky-rng" }
 swanky-error            = { git = "https://github.com/GaloisInc/swanky", package = "swanky-error" }

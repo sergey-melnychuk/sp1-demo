@@ -36,8 +36,7 @@ fn main() -> Result<()> {
     eprintln!("loading witness from {}", args.witness_in.display());
     let bytes = fs::read(&args.witness_in)
         .with_context(|| format!("read {}", args.witness_in.display()))?;
-    let witness: TlsWitness =
-        bincode::deserialize(&bytes).context("decode TlsWitness")?;
+    let witness: TlsWitness = bincode::deserialize(&bytes).context("decode TlsWitness")?;
 
     eprintln!(
         "witness loaded: host={} field={} threshold={} inbound={} outbound={} notary={}",

@@ -21,9 +21,9 @@ pub struct HandshakeCapture {
 /// SHA-256 over length-prefixed outbound || inbound handshake captures.
 pub fn handshake_transcript_hash(outbound: &[u8], inbound: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(&(outbound.len() as u64).to_be_bytes());
+    h.update((outbound.len() as u64).to_be_bytes());
     h.update(outbound);
-    h.update(&(inbound.len() as u64).to_be_bytes());
+    h.update((inbound.len() as u64).to_be_bytes());
     h.update(inbound);
     h.finalize().into()
 }
@@ -41,7 +41,7 @@ pub fn cert_chain_hash(certs: &[impl AsRef<[u8]>]) -> [u8; 32] {
     let mut h = Sha256::new();
     for cert in certs {
         let der = cert.as_ref();
-        h.update(&(der.len() as u32).to_be_bytes());
+        h.update((der.len() as u32).to_be_bytes());
         h.update(der);
     }
     h.finalize().into()
@@ -49,10 +49,7 @@ pub fn cert_chain_hash(certs: &[impl AsRef<[u8]>]) -> [u8; 32] {
 
 const MAX_HANDSHAKE_BYTES: u32 = 256 * 1024;
 
-pub fn write_handshake_capture(
-    ch: &mut Channel,
-    cap: &HandshakeCapture,
-) -> SwankyResult<()> {
+pub fn write_handshake_capture(ch: &mut Channel, cap: &HandshakeCapture) -> SwankyResult<()> {
     if cap.outbound.len() as u32 > MAX_HANDSHAKE_BYTES
         || cap.inbound.len() as u32 > MAX_HANDSHAKE_BYTES
     {
@@ -68,7 +65,10 @@ pub fn write_handshake_capture(
     ch.write_bytes(&(cap.inbound.len() as u32).to_be_bytes())?;
     ch.write_bytes(&cap.inbound)?;
     ch.force_flush().map_err(|e| {
-        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "flush handshake: {e}")
+        swanky_error::swanky_error!(
+            swanky_error::ErrorKind::NetworkError,
+            "flush handshake: {e}"
+        )
     })?;
     Ok(())
 }
@@ -132,14 +132,13 @@ pub fn verify_handshake_capture(
         );
     }
 
-    let cert_ders = cert_chain_ders_from_handshake(&cap.outbound, &cap.inbound, ikm).ok_or_else(
-        || {
+    let cert_ders =
+        cert_chain_ders_from_handshake(&cap.outbound, &cap.inbound, ikm).ok_or_else(|| {
             swanky_error::swanky_error!(
                 swanky_error::ErrorKind::OtherError,
                 "could not parse Certificate chain from handshake capture"
             )
-        },
-    )?;
+        })?;
     let cert_hash = cert_chain_hash(&cert_ders);
     if cert_hash != cap.cert_chain_hash {
         swanky_error::bail!(
@@ -148,8 +147,8 @@ pub fn verify_handshake_capture(
         );
     }
 
-    let (after_sh, after_sf) =
-        transcript_hashes_with_ikm(&cap.outbound, &cap.inbound, ikm).ok_or_else(|| {
+    let (after_sh, after_sf) = transcript_hashes_with_ikm(&cap.outbound, &cap.inbound, ikm)
+        .ok_or_else(|| {
             swanky_error::swanky_error!(
                 swanky_error::ErrorKind::OtherError,
                 "transcript hash recomputation failed on notary"
@@ -159,8 +158,7 @@ pub fn verify_handshake_capture(
     let mut binding = production_session_binding();
     binding.server_epk = cap.server_epk;
     binding.cert_chain_hash = cert_hash;
-    binding.handshake_transcript_hash =
-        handshake_transcript_hash(&cap.outbound, &cap.inbound);
+    binding.handshake_transcript_hash = handshake_transcript_hash(&cap.outbound, &cap.inbound);
     binding.key_schedule_context_hash = key_schedule_context_hash(&after_sh, &after_sf);
 
     Ok(VerifiedHandshake {

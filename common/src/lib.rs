@@ -23,7 +23,7 @@ pub struct SessionBinding {
     pub circuit_aes_sha256: [u8; 32],
     /// SHA-256 of bundled `sha-256-compress.txt`.
     pub circuit_sha256_compress_sha256: [u8; 32],
-    /// `0` = semi-honest twopac (legacy), `1` = authenticated garbling.
+    /// `0` = semi-honest twopac (legacy), `3` = full WRK17 record layer (`GARBLING_FULL_AUTH`).
     pub garbling_mode: u8,
 }
 
@@ -106,6 +106,7 @@ impl NotaryBundle {
     }
 
     /// Pre-binding (v0) signing bytes — no version prefix, no [`SessionBinding`].
+    #[allow(clippy::too_many_arguments)]
     pub fn legacy_signing_bytes_pre_binding(
         notary_pubkey: &[u8; 32],
         timestamp_unix: u64,
@@ -279,11 +280,14 @@ pub struct NotaryAttestation {
 /// keys, decrypts handshake records, verifies the certificate chain and
 /// CertificateVerify, and decrypts application data.
 ///
-/// Trust boundary: the host holds both esk_client and raw_inbound (which
-/// contains epk_server in the ServerHello). It can therefore derive
-/// shared_secret and server_write_key — meaning a malicious host can forge
-/// application-data records. This is acceptable for self-proving (the user IS
-/// the host). Delegated proving requires MPC-TLS or a TEE; see NEXT.md §6.5.
+/// Trust boundary (self-prove): the host holds both `esk_client` and `raw_inbound` (which
+/// contains `epk_server` in the ServerHello). It can therefore derive `shared_secret` and
+/// `server_write_key` — a malicious host could forge application-data records. That is
+/// acceptable when the prover is the same party that fetched (`notary == None`).
+///
+/// Delegated proving uses the notary witness path (`notary: Some(_)`): the guest checks the
+/// signed bundle and record commits instead of re-running full TLS verification. The MPC/2PC
+/// code that produces the bundle is replaceable — see `PROD.md` §2.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsWitness {
     /// Client ephemeral X25519 private key (32 bytes). Only used in
@@ -306,9 +310,9 @@ pub struct TlsWitness {
     pub json_field: String,
     pub threshold: f64,
 
-    /// If `Some`, the witness was produced via a 2PC session with a notary.
-    /// The guest verifies the bundle's Ed25519 signature and uses the bundle's
-    /// `K_N` (plus the attestation's `K_C`) to reconstruct the TLS keys —
+    /// If `Some`, the witness was attested by a notary backend (any producer of
+    /// [`NotaryAttestation`]). The guest verifies the bundle's Ed25519 signature and uses the
+    /// bundle's `K_N` (plus the attestation's `K_C`) to reconstruct the TLS keys —
     /// `esk_client` above is ignored in that case.
     #[serde(default)]
     pub notary: Option<NotaryAttestation>,

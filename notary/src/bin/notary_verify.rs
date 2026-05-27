@@ -35,11 +35,24 @@ fn hex(bytes: &[u8]) -> String {
 fn print_binding(b: &SessionBinding) {
     println!("  server_epk:                 {}", hex(&b.server_epk));
     println!("  cert_chain_hash:            {}", hex(&b.cert_chain_hash));
-    println!("  handshake_transcript_hash:  {}", hex(&b.handshake_transcript_hash));
-    println!("  key_schedule_context_hash:  {}", hex(&b.key_schedule_context_hash));
-    println!("  circuit_aes_sha256:         {}", hex(&b.circuit_aes_sha256));
-    println!("  circuit_sha256_compress:    {}", hex(&b.circuit_sha256_compress_sha256));
+    println!(
+        "  handshake_transcript_hash:  {}",
+        hex(&b.handshake_transcript_hash)
+    );
+    println!(
+        "  key_schedule_context_hash:  {}",
+        hex(&b.key_schedule_context_hash)
+    );
+    println!(
+        "  circuit_aes_sha256:         {}",
+        hex(&b.circuit_aes_sha256)
+    );
+    println!(
+        "  circuit_sha256_compress:    {}",
+        hex(&b.circuit_sha256_compress_sha256)
+    );
     let mode_label = match b.garbling_mode {
+        3 => "WRK17 HKDF+AES+GHASH",
         2 => "WRK17 HKDF+AES (GHASH semi-honest)",
         1 => "WRK17 HKDF only",
         _ => "legacy/semi-honest",
@@ -52,8 +65,8 @@ fn print_binding(b: &SessionBinding) {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let raw = fs::read(&args.bundle)
-        .with_context(|| format!("read bundle {}", args.bundle.display()))?;
+    let raw =
+        fs::read(&args.bundle).with_context(|| format!("read bundle {}", args.bundle.display()))?;
     let bundle: NotaryBundle =
         bincode::deserialize(&raw).context("bincode deserialize NotaryBundle")?;
 
@@ -89,32 +102,32 @@ fn main() -> Result<()> {
         bail!("bundle signature verification failed");
     }
 
-    if bundle.bundle_version >= NotaryBundle::BUNDLE_VERSION_BINDING {
-        if let (Some(out_path), Some(in_path)) = (&args.outbound, &args.inbound) {
-            let outbound = fs::read(out_path)
-                .with_context(|| format!("read outbound {}", out_path.display()))?;
-            let inbound = fs::read(in_path)
-                .with_context(|| format!("read inbound {}", in_path.display()))?;
-            let ht = handshake_transcript_hash(&outbound, &inbound);
-            if ht != bundle.binding.handshake_transcript_hash {
-                bail!(
-                    "handshake_transcript_hash mismatch: bundle={} recomputed={}",
-                    hex(&bundle.binding.handshake_transcript_hash),
-                    hex(&ht)
-                );
-            }
-            let epk = parse_server_hello_key_share(&inbound).context("parse ServerHello epk")?;
-            if epk != bundle.binding.server_epk {
-                bail!(
-                    "server_epk mismatch: bundle={} parsed={}",
-                    hex(&bundle.binding.server_epk),
-                    hex(&epk)
-                );
-            }
-            println!("--- witness cross-check ---");
-            println!("  handshake_transcript_hash: OK");
-            println!("  server_epk:                OK");
+    if bundle.bundle_version >= NotaryBundle::BUNDLE_VERSION_BINDING
+        && let (Some(out_path), Some(in_path)) = (&args.outbound, &args.inbound)
+    {
+        let outbound =
+            fs::read(out_path).with_context(|| format!("read outbound {}", out_path.display()))?;
+        let inbound =
+            fs::read(in_path).with_context(|| format!("read inbound {}", in_path.display()))?;
+        let ht = handshake_transcript_hash(&outbound, &inbound);
+        if ht != bundle.binding.handshake_transcript_hash {
+            bail!(
+                "handshake_transcript_hash mismatch: bundle={} recomputed={}",
+                hex(&bundle.binding.handshake_transcript_hash),
+                hex(&ht)
+            );
         }
+        let epk = parse_server_hello_key_share(&inbound).context("parse ServerHello epk")?;
+        if epk != bundle.binding.server_epk {
+            bail!(
+                "server_epk mismatch: bundle={} parsed={}",
+                hex(&bundle.binding.server_epk),
+                hex(&epk)
+            );
+        }
+        println!("--- witness cross-check ---");
+        println!("  handshake_transcript_hash: OK");
+        println!("  server_epk:                OK");
     }
 
     Ok(())

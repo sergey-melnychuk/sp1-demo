@@ -31,17 +31,16 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use notary::ecdh::{
-    combined_client_esk, generate_share, host_send_ecdh_leaky, host_send_ecdh_ot,
+    EphemeralShare, combined_client_esk, generate_share, host_send_ecdh_leaky, host_send_ecdh_ot,
     host_skip_ecdh_leaky, parse_server_hello_key_share, reference_ikm, share_from_bytes,
-    EphemeralShare,
 };
-use notary::handshake::{cert_chain_hash, write_handshake_capture, HandshakeCapture};
-use notary::hkdf::reference_tls13_client_traffic;
-use notary::transcript::transcript_hashes_with_ikm;
+use notary::garble::Wrk17ClientSession;
+use notary::handshake::{HandshakeCapture, cert_chain_hash, write_handshake_capture};
+use notary::hkdf::{client_tls13_client_traffic_from_ikm_shares, reference_tls13_client_traffic};
 use notary::tls::{
-    client_decrypt_record, client_encrypt_record, client_finish_session, client_run_2pc_traffic_hkdf,
-    tls13_aad, ChannelRw,
+    ChannelRw, client_decrypt_record, client_encrypt_record, client_finish_session, tls13_aad,
 };
+use notary::transcript::transcript_hashes_with_ikm;
 use rand::RngCore;
 use rustls::crypto::cipher::AeadKey;
 use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
@@ -280,8 +279,9 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
     notary_tcp.set_nodelay(true)?;
 
     let session_result = Channel::with(notary_tcp, |ch| -> swanky_error::Result<_> {
-        ch.write_bytes(&[SETUP_2PC_TRAFFIC_KEYS])
-            .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+        ch.write_bytes(&[SETUP_2PC_TRAFFIC_KEYS]).map_err(|e| {
+            swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+        })?;
         let mut notary_scalar = [0u8; 32];
         ch.read_bytes(&mut notary_scalar)?;
         let notary_share = share_from_bytes(&notary_scalar);
@@ -290,8 +290,7 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
         eprintln!("phase 0a: scalar share received — ClientHello uses split ephemeral");
 
         let mut provider = make_provider(esk);
-        provider.cipher_suites =
-            vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+        provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
         let mut config = map_rustls(
             ClientConfig::builder_with_provider(Arc::new(provider))
                 .with_protocol_versions(&[&rustls::version::TLS13]),
@@ -302,12 +301,9 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
         .with_no_client_auth();
         config.enable_secret_extraction = true;
 
-        let server_name: rustls::pki_types::ServerName = host
-            .clone()
-            .try_into()
-            .map_err(|_| {
-                swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "invalid server name")
-            })?;
+        let server_name: rustls::pki_types::ServerName = host.clone().try_into().map_err(|_| {
+            swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "invalid server name")
+        })?;
 
         eprintln!("phase 1: TCP+TLS handshake to {host}:{port}");
         let tcp = map_io(TcpStream::connect(format!("{host}:{port}")))?;
@@ -342,8 +338,9 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
                 .set_read_timeout(Some(Duration::from_secs(15))),
         )?;
 
-        let server_epk = parse_server_hello_key_share(&capturing.inbound)
-            .ok_or_else(|| swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "no server epk"))?;
+        let server_epk = parse_server_hello_key_share(&capturing.inbound).ok_or_else(|| {
+            swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "no server epk")
+        })?;
         let cert_hash = tls
             .peer_certificates()
             .map(|certs| {
@@ -352,14 +349,14 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
             })
             .unwrap_or([0u8; 32]);
         let ikm_oracle = reference_ikm(&host_share, &notary_share, &server_epk);
-        let (after_sh, after_sf) = transcript_hashes_with_ikm(
-            &capturing.outbound,
-            &capturing.inbound,
-            &ikm_oracle.0,
-        )
-        .ok_or_else(|| {
-            swanky_error::swanky_error!(swanky_error::ErrorKind::OtherError, "transcript hashes")
-        })?;
+        let (after_sh, after_sf) =
+            transcript_hashes_with_ikm(&capturing.outbound, &capturing.inbound, &ikm_oracle.0)
+                .ok_or_else(|| {
+                    swanky_error::swanky_error!(
+                        swanky_error::ErrorKind::OtherError,
+                        "transcript hashes"
+                    )
+                })?;
         let (_, tx_iv, _, rx_iv) =
             reference_tls13_client_traffic(&ikm_oracle.0, &after_sh, &after_sf);
 
@@ -405,10 +402,14 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
             },
         )?;
         let mut io = ChannelRw(ch);
-        let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
-            .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+        let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk).map_err(|e| {
+            swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+        })?;
         ch.force_flush().map_err(|e| {
-            swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+            swanky_error::swanky_error!(
+                swanky_error::ErrorKind::NetworkError,
+                "post-ECDH flush: {e}"
+            )
         })?;
         eprintln!(
             "phase 3b: host XOR IKM share={} (2PC HKDF next)",
@@ -420,11 +421,16 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
         let mut tcp = capturing.inner;
 
         eprintln!("phase 4a: 2PC HKDF traffic key schedule (OP_2PC_HKDF)");
-        let traffic =
-            client_run_2pc_traffic_hkdf(ch, outcome.host_ikm_share, after_sh, after_sf)?;
+        let mut wrk17 = Wrk17ClientSession::init(ch)?;
+        let traffic = client_tls13_client_traffic_from_ikm_shares(
+            ch,
+            outcome.host_ikm_share,
+            after_sh,
+            after_sf,
+            &mut wrk17,
+        )?;
         let k_c_tx = traffic.k_c_tx;
         let k_c_rx = traffic.k_c_rx;
-        let mut tx_seq = 0u64;
         let mut rx_seq = 0u64;
 
         let http_request = format!(
@@ -438,12 +444,12 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
         inner.push(0x17);
         let aad = tls13_aad(inner.len() + 16);
 
-        let (ct, tag) = client_encrypt_record(ch, k_c_tx, tx_iv, &inner, &aad, tx_seq)?;
-        tx_seq += 1;
+        let (ct, tag) = client_encrypt_record(ch, &mut wrk17, k_c_tx, tx_iv, &inner, &aad, 0)?;
         let mut record_payload = ct.clone();
         record_payload.extend_from_slice(&tag);
-        let req_raw = write_tls_record(&mut tcp, 0x17, 0x0303, &record_payload)
-            .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+        let req_raw = write_tls_record(&mut tcp, 0x17, 0x0303, &record_payload).map_err(|e| {
+            swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+        })?;
         raw_outbound.extend_from_slice(&req_raw);
 
         let mut full = Vec::new();
@@ -468,14 +474,18 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
             let mut tag = [0u8; 16];
             tag.copy_from_slice(&payload[tag_start..]);
             let ct = payload[..tag_start].to_vec();
-            let plain = client_decrypt_record(ch, k_c_rx, rx_iv, &ct, tag, &aad, rx_seq)?;
+            let plain =
+                client_decrypt_record(ch, &mut wrk17, k_c_rx, rx_iv, &ct, tag, &aad, rx_seq)?;
             rx_seq += 1;
             let mut buf = plain;
             while buf.last() == Some(&0u8) {
                 buf.pop();
             }
             let Some(inner_ct) = buf.pop() else {
-                swanky_error::bail!(swanky_error::ErrorKind::OtherError, "empty decrypted record");
+                swanky_error::bail!(
+                    swanky_error::ErrorKind::OtherError,
+                    "empty decrypted record"
+                );
             };
             if inner_ct == 0x17 {
                 full.extend_from_slice(&buf);
@@ -491,7 +501,16 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
                 .unwrap_or(0)
         );
         let bundle = client_finish_session(ch, &session_id, &host)?;
-        Ok((full, bundle, raw_inbound, raw_outbound, k_c_tx, k_c_rx, tx_iv, rx_iv))
+        Ok((
+            full,
+            bundle,
+            raw_inbound,
+            raw_outbound,
+            k_c_tx,
+            k_c_rx,
+            tx_iv,
+            rx_iv,
+        ))
     })
     .map_err(|e| anyhow::anyhow!("notary session: {e:#}"))?;
 
@@ -513,7 +532,6 @@ fn run_two_pc_traffic_demo(args: Args) -> Result<()> {
 }
 
 fn run_legacy_demo(args: Args) -> Result<()> {
-
     let url = url::Url::parse(&args.url).context("invalid URL")?;
     if url.scheme() != "https" {
         bail!("URL must be https://");
@@ -553,7 +571,8 @@ fn run_legacy_demo(args: Args) -> Result<()> {
             .context("write setup mode")?;
         nm.flush().context("flush setup mode")?;
         let mut kn = [0u8; 32];
-        nm.read_exact(&mut kn).context("read notary XOR mask frame")?;
+        nm.read_exact(&mut kn)
+            .context("read notary XOR mask frame")?;
         let mut notary_scalar = [0u8; 32];
         nm.read_exact(&mut notary_scalar)
             .context("read notary scalar share")?;
@@ -565,8 +584,7 @@ fn run_legacy_demo(args: Args) -> Result<()> {
         notary_ecdh_share = Some(notary_share);
         let esk = combined_client_esk(&host_share, &notary_share);
         provider = make_provider(esk);
-        provider.cipher_suites =
-            vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+        provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
         eprintln!(
             "phase 0a: notary XOR masks + scalar share received — ClientHello uses split ephemeral"
         );
@@ -601,7 +619,8 @@ fn run_legacy_demo(args: Args) -> Result<()> {
     }
     // Flush any leftover records rustls has queued (e.g. our own Finished).
     while tls.wants_write() {
-        tls.write_tls(&mut capturing).context("flush post-handshake")?;
+        tls.write_tls(&mut capturing)
+            .context("flush post-handshake")?;
     }
     // Drain any post-handshake records the server queued (e.g. NewSessionTicket).
     capturing
@@ -640,64 +659,64 @@ fn run_legacy_demo(args: Args) -> Result<()> {
 
     eprintln!("phase 3: finalizing setup with notary at {}", args.notary);
     notary_tcp = if let Some(mut nm) = notary_pre_tls {
-            nm.write_all(&tx_iv).context("write IV_tx")?;
-            nm.write_all(&rx_iv).context("write IV_rx")?;
-            nm.flush().context("flush IVs")?;
-            if args.skip_ecdh_wire {
-                eprintln!("phase 3b: skipping ECDH wire (--skip-ecdh-wire)");
-                host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
-                nm.flush().context("flush ECDH skip")?;
-            } else if let Some(epk) = server_epk {
-                let host_share = host_ecdh_share
+        nm.write_all(&tx_iv).context("write IV_tx")?;
+        nm.write_all(&rx_iv).context("write IV_rx")?;
+        nm.flush().context("flush IVs")?;
+        if args.skip_ecdh_wire {
+            eprintln!("phase 3b: skipping ECDH wire (--skip-ecdh-wire)");
+            host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
+            nm.flush().context("flush ECDH skip")?;
+        } else if let Some(epk) = server_epk {
+            let host_share = host_ecdh_share
+                .as_ref()
+                .context("mode 1 requires host ECDH share from phase 0a")?;
+            if args.leaky_ecdh_wire {
+                eprintln!("phase 3b: leaky additive ECDH (debug — cleartext partials)");
+                let notary_share = notary_ecdh_share
                     .as_ref()
-                    .context("mode 1 requires host ECDH share from phase 0a")?;
-                if args.leaky_ecdh_wire {
-                    eprintln!("phase 3b: leaky additive ECDH (debug — cleartext partials)");
-                    let notary_share = notary_ecdh_share
-                        .as_ref()
-                        .context("mode 1 requires notary ECDH share from phase 0a")?;
-                    let outcome = host_send_ecdh_leaky(&mut nm, host_share, notary_share, &epk)
-                        .context("leaky ECDH wire")?;
-                    nm.flush().context("flush leaky ECDH")?;
-                    eprintln!(
-                        "phase 3b: host-side IKM={} (both parties learn full IKM)",
-                        hex_encode(&outcome.ikm.0)
-                    );
-                } else {
-                    eprintln!("phase 3b: OT-blinded ECDH (server epk from ServerHello)");
-                    let outcome =
-                        host_send_ecdh_ot(&mut nm, host_share, &epk).context("OT ECDH wire")?;
-                    nm.flush().context("flush OT ECDH")?;
-                    eprintln!(
-                        "phase 3b: host XOR IKM share={} (full IKM not sent to host)",
-                        hex_encode(&outcome.host_ikm_share)
-                    );
-                }
+                    .context("mode 1 requires notary ECDH share from phase 0a")?;
+                let outcome = host_send_ecdh_leaky(&mut nm, host_share, notary_share, &epk)
+                    .context("leaky ECDH wire")?;
+                nm.flush().context("flush leaky ECDH")?;
+                eprintln!(
+                    "phase 3b: host-side IKM={} (both parties learn full IKM)",
+                    hex_encode(&outcome.ikm.0)
+                );
             } else {
-                eprintln!("phase 3b: no ServerHello key_share in capture — skipping ECDH");
-                host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
-                nm.flush().context("flush ECDH skip")?;
+                eprintln!("phase 3b: OT-blinded ECDH (server epk from ServerHello)");
+                let outcome =
+                    host_send_ecdh_ot(&mut nm, host_share, &epk).context("OT ECDH wire")?;
+                nm.flush().context("flush OT ECDH")?;
+                eprintln!(
+                    "phase 3b: host XOR IKM share={} (full IKM not sent to host)",
+                    hex_encode(&outcome.host_ikm_share)
+                );
             }
-            nm
         } else {
-            rand::thread_rng().fill_bytes(&mut k_n_tx);
-            rand::thread_rng().fill_bytes(&mut k_n_rx);
+            eprintln!("phase 3b: no ServerHello key_share in capture — skipping ECDH");
+            host_skip_ecdh_leaky(&mut nm).context("write SETUP_ECDH_SKIP")?;
+            nm.flush().context("flush ECDH skip")?;
+        }
+        nm
+    } else {
+        rand::thread_rng().fill_bytes(&mut k_n_tx);
+        rand::thread_rng().fill_bytes(&mut k_n_rx);
 
-            let mut nm = TcpStream::connect(&args.notary)
-                .with_context(|| format!("connect to notary {}", args.notary))?;
-            nm.set_nodelay(true)?;
-            nm.write_all(&[SETUP_LEGACY_HOST_MASKS])
-                .context("write legacy setup mode")?;
+        let mut nm = TcpStream::connect(&args.notary)
+            .with_context(|| format!("connect to notary {}", args.notary))?;
+        nm.set_nodelay(true)?;
+        nm.write_all(&[SETUP_LEGACY_HOST_MASKS])
+            .context("write legacy setup mode")?;
 
-            let mut setup = [0u8; 56];
-            setup[..16].copy_from_slice(&k_n_tx);
-            setup[16..28].copy_from_slice(&tx_iv);
-            setup[28..44].copy_from_slice(&k_n_rx);
-            setup[44..56].copy_from_slice(&rx_iv);
-            nm.write_all(&setup).context("write legacy setup frame")?;
-            nm.flush().context("flush legacy setup")?;
-            nm
-        };
+        let mut setup = [0u8; 56];
+        setup[..16].copy_from_slice(&k_n_tx);
+        setup[16..28].copy_from_slice(&tx_iv);
+        setup[28..44].copy_from_slice(&k_n_rx);
+        setup[44..56].copy_from_slice(&rx_iv);
+        nm.write_all(&setup).context("write legacy setup frame")?;
+        nm.flush().context("flush legacy setup")?;
+        nm
+    };
 
     // ── Phase 4: take over the record layer manually via 2PC ──────────────
     let http_request = format!(
@@ -721,21 +740,22 @@ fn run_legacy_demo(args: Args) -> Result<()> {
     // calls would lose buffered bytes between operations.
     let session_result = Channel::with(&mut notary_tcp, |ch| -> swanky_error::Result<_> {
         // Encrypt request via 2PC; send the resulting record to the server.
-        let (ct, tag) = client_encrypt_record(ch, k_c_tx, tx_iv, &inner, &aad, tx_seq)?;
+        let mut wrk17 = Wrk17ClientSession::init(ch)?;
+        let (ct, tag) = client_encrypt_record(ch, &mut wrk17, k_c_tx, tx_iv, &inner, &aad, tx_seq)?;
         tx_seq += 1;
         let mut record_payload = ct.clone();
         record_payload.extend_from_slice(&tag);
         let req_raw = match write_tls_record(&mut tcp, 0x17, 0x0303, &record_payload) {
             Ok(raw) => raw,
             Err(e) => {
-                swanky_error::bail!(
-                    swanky_error::ErrorKind::NetworkError,
-                    "write request: {e}"
-                );
+                swanky_error::bail!(swanky_error::ErrorKind::NetworkError, "write request: {e}");
             }
         };
         raw_outbound.extend_from_slice(&req_raw);
-        eprintln!("phase 4: request record sent ({} bytes on wire)", req_raw.len());
+        eprintln!(
+            "phase 4: request record sent ({} bytes on wire)",
+            req_raw.len()
+        );
 
         // ── Phase 5: read response records, decrypt each via 2PC ──────
         let mut full = Vec::new();
@@ -750,10 +770,7 @@ fn run_legacy_demo(args: Args) -> Result<()> {
             };
             raw_inbound.extend_from_slice(&raw);
             if ct_kind != 0x17 {
-                eprintln!(
-                    "unexpected record content type 0x{:02x}, stopping",
-                    ct_kind
-                );
+                eprintln!("unexpected record content type 0x{:02x}, stopping", ct_kind);
                 break;
             }
             if payload.len() < 16 {
@@ -765,7 +782,8 @@ fn run_legacy_demo(args: Args) -> Result<()> {
             tag.copy_from_slice(&payload[tag_start..]);
             let ct = payload[..tag_start].to_vec();
 
-            let plain = client_decrypt_record(ch, k_c_rx, rx_iv, &ct, tag, &aad, rx_seq)?;
+            let plain =
+                client_decrypt_record(ch, &mut wrk17, k_c_rx, rx_iv, &ct, tag, &aad, rx_seq)?;
             rx_seq += 1;
             let mut buf = plain;
             while buf.last() == Some(&0u8) {
@@ -800,7 +818,16 @@ fn run_legacy_demo(args: Args) -> Result<()> {
         );
         eprintln!("phase 6: requesting signed bundle from notary");
         let bundle = client_finish_session(ch, &session_id, &host)?;
-        Ok((full, bundle, raw_inbound, raw_outbound, k_c_tx, k_c_rx, tx_iv, rx_iv))
+        Ok((
+            full,
+            bundle,
+            raw_inbound,
+            raw_outbound,
+            k_c_tx,
+            k_c_rx,
+            tx_iv,
+            rx_iv,
+        ))
     })
     .map_err(|e| anyhow::anyhow!("notary session: {e:#}"))?;
     let (full_plaintext, bundle, raw_inbound, raw_outbound, k_c_tx, k_c_rx, tx_iv, rx_iv) =
@@ -821,6 +848,7 @@ fn run_legacy_demo(args: Args) -> Result<()> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_demo_output(
     full_plaintext: &[u8],
     bundle: &notary::NotaryBundle,
@@ -865,8 +893,14 @@ fn print_demo_output(
     if bundle.bundle_version >= sp1_demo_common::NotaryBundle::BUNDLE_VERSION_BINDING {
         let b = &bundle.binding;
         println!("--- session binding ---");
-        println!("  server_epk:                 {}", hex_encode(&b.server_epk));
-        println!("  cert_chain_hash:            {}", hex_encode(&b.cert_chain_hash));
+        println!(
+            "  server_epk:                 {}",
+            hex_encode(&b.server_epk)
+        );
+        println!(
+            "  cert_chain_hash:            {}",
+            hex_encode(&b.cert_chain_hash)
+        );
         println!(
             "  handshake_transcript_hash:  {}",
             hex_encode(&b.handshake_transcript_hash)
@@ -894,8 +928,7 @@ fn print_demo_output(
             }),
         };
         let bytes = bincode::serialize(&witness).context("serialize TlsWitness")?;
-        std::fs::write(out, &bytes)
-            .with_context(|| format!("write witness {}", out.display()))?;
+        std::fs::write(out, &bytes).with_context(|| format!("write witness {}", out.display()))?;
         eprintln!(
             "wrote SP1 witness ({} bytes) to {}",
             bytes.len(),
@@ -913,9 +946,7 @@ fn print_demo_output(
 }
 
 /// Pull `(key, iv)` out of `ConnectionTrafficSecrets`, requiring AES-128-GCM.
-fn aes128_gcm_from_secrets(
-    s: &rustls::ConnectionTrafficSecrets,
-) -> Result<([u8; 16], [u8; 12])> {
+fn aes128_gcm_from_secrets(s: &rustls::ConnectionTrafficSecrets) -> Result<([u8; 16], [u8; 12])> {
     use rustls::ConnectionTrafficSecrets;
     match s {
         ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {

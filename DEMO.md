@@ -10,6 +10,14 @@ and every application record is encrypted/decrypted via split-key 2PC AES-GCM
 byte-identical to what a normal TLS client would produce — the server has no
 idea anything unusual happened.
 
+| Doc | Purpose |
+|-----|---------|
+| [`INFO.md`](INFO.md) | Full repo guide (crates, modules, crypto) |
+| [`README.md`](README.md) | SP1 self-prove + witness overview |
+| [`PROD.md`](PROD.md) | Production roadmap |
+| [`ECDH.md`](ECDH.md) | ECDH wire protocol |
+| [`TODO.md`](TODO.md) | Backlog |
+
 ## Demo modes
 
 `notary_proxy` reads a **setup mode byte** on connect. `notary_demo` picks the
@@ -33,9 +41,11 @@ schedule (public on the notary side). The host never calls
 `dangerous_extract_secrets()` for record-layer keys (unless `--verify-rustls-keys`
 is set for a debug cross-check).
 
-> **Honesty limits:** WRK17 for **HKDF compress** and **AES blocks** (mode 2);
-> GHASH stays semi-honest. The notary is still trusted (learns full IKM on the OT
-> path, holds public IVs). Full OT-MtA X25519 is not implemented.
+> **Honesty limits:** WRK17 for **HKDF compress**, **AES blocks**, and **GHASH**
+> (one unrolled chain per record direction); KOS OT extension is reused for the
+> whole host↔notary channel via `Wrk17*Session`. The notary is still trusted
+> (learns full IKM on the OT path, holds public IVs). Full OT-MtA X25519 is not
+> implemented.
 
 ## Quick start
 
@@ -79,10 +89,34 @@ cargo build --release --bin notary_proxy --bin notary_demo --bin notary_verify
     --inbound /path/to/raw_inbound.bin
 ```
 
-Expected wall-clock for a ~1.4 KB response: **~10–30 s** in mode 1, **longer in
-mode 2** (WRK17 HKDF compress rounds + extra schedule before AES). Release builds
+Expected wall-clock for a ~1.4 KB response: **~10–30 s** in mode 1, **minutes in
+mode 2** (many WRK17 SHA-256 compress rounds for full HKDF before AES). Release builds
 are mandatory. Mode 2 E2E against `jsonplaceholder.typicode.com` completes with
 HTTP 200 + `verify(): ok` on the signed bundle.
+
+### SP1 witness export (notary → zkVM)
+
+After a successful demo run, export a bincode `TlsWitness` and prove with the SP1 host:
+
+```bash
+# Terminal B — mode 2 + witness (example field from JSONPlaceholder post)
+./target/release/notary_demo \
+    --two-pc-traffic-keys \
+    --url https://jsonplaceholder.typicode.com/posts/1 \
+    --notary 127.0.0.1:9001 \
+    --witness-out /tmp/witness.bin \
+    --field "/userId" \
+    --threshold 0
+
+# From repo root
+SP1_PROVER=mock cargo run --release -p sp1-demo-host --bin notarized -- \
+    --witness-in /tmp/witness.bin \
+    --prove
+```
+
+The guest **notary path** checks the Ed25519 bundle, transcript binding, record commits,
+and the JSON claim — it does not re-run full cert/`CertificateVerify` in the zkVM today.
+See [`README.md`](README.md) and [`PROD.md`](PROD.md).
 
 ### Other flags (mode 1 only)
 
@@ -181,13 +215,27 @@ See [`ECDH.md`](ECDH.md) for ECDH framing.
 - Raw handshake bytes to notary + independent transcript verify (`handshake.rs`)
 - Signed bundle v1 with `SessionBinding` + `notary_verify` CLI
 - Mode 2 2PC HKDF without host extract for record keys
-- **WRK17 authenticated garbling for HKDF compress + AES blocks** (`garble.rs`,
-  `aes.rs`; `garbling_mode = GARBLING_GCM_AES_AUTH` (2) in bundle)
-- Semi-honest GHASH within each encrypt/decrypt (one session per record op)
+- **WRK17 authenticated garbling** for HKDF compress, AES blocks, and GHASH
+  (`garble.rs`, `hkdf.rs`, `aes.rs`, `ghash.rs`; unrolled GHASH chain + OT session
+  reuse on one `Channel::with` in mode 2)
 
 **Not yet:**
 
-- WRK17 GHASH; full OT-MtA X25519
-- GCM tag inside circuit; OT amortization per session
+- Full OT-MtA X25519
+- GCM tag inside circuit
+- Batched WRK17 for per-block AES (still one circuit per AES block)
+- Unrolled HMAC (4 compresses per HMAC in one WRK17 session)
+- SP1 guest: in-circuit full TLS verify on notary path
+
+### Tests & lint
+
+```bash
+cd notary
+cargo test --release -p notary --lib          # fast suite (~18 s)
+cargo clippy --all-targets -- -D warnings
+```
+
+Heavy WRK17 integration tests (`hkdf_over_*`, `decrypt_2pc`, …) are `#[ignore]` —
+run with `cargo test --release … -- --ignored` when needed.
 
 See [`TODO.md`](TODO.md) for the full gap list.

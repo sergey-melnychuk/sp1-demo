@@ -38,12 +38,11 @@ use swanky_error::Result as SwankyResult;
 // guest can verify the same struct without depending on this crate.
 pub use sp1_demo_common::{NotaryBundle, RecordCommit, SessionBinding};
 
-use crate::garble::production_session_binding;
-
 use crate::aes::{
     NotaryCommit, client_decrypt_gcm_2pc, client_encrypt_gcm, notary_decrypt_gcm,
     notary_encrypt_gcm,
 };
+use crate::garble::{Wrk17ClientSession, Wrk17NotarySession};
 
 // ── TLS 1.3 per-record nonce / AAD (RFC 8446 §5.2, §5.3) ──────────────────────
 
@@ -90,12 +89,13 @@ impl TwoPartyGcmEncrypter {
     pub fn encrypt_record(
         &self,
         channel: &mut Channel,
+        session: &mut Wrk17ClientSession,
         seq: u64,
         plaintext: &[u8],
         aad: &[u8],
     ) -> SwankyResult<(Vec<u8>, [u8; 16])> {
         let nonce = tls13_nonce(&self.base_iv, seq);
-        client_encrypt_gcm(channel, self.k_c, plaintext, aad, nonce)
+        client_encrypt_gcm(channel, self.k_c, plaintext, aad, nonce, session)
     }
 }
 
@@ -115,12 +115,13 @@ impl NotaryTlsSession {
     pub fn encrypt_record(
         &self,
         channel: &mut Channel,
+        session: &mut Wrk17NotarySession,
         seq: u64,
         plaintext_len: usize,
         aad: &[u8],
     ) -> SwankyResult<()> {
         let nonce = tls13_nonce(&self.base_iv, seq);
-        notary_encrypt_gcm(channel, self.k_n, nonce, aad, plaintext_len)
+        notary_encrypt_gcm(channel, self.k_n, nonce, aad, plaintext_len, session)
     }
 
     /// Commit-before-reveal: notary signs `H(ciphertext, nonce, session_id)`
@@ -204,7 +205,12 @@ fn read_header(ch: &mut Channel) -> SwankyResult<Header> {
     let mut pl_buf = [0u8; 4];
     ch.read_bytes(&mut pl_buf)?;
     let payload_len = u32::from_be_bytes(pl_buf);
-    Ok(Header { op: op[0], seq, aad, payload_len })
+    Ok(Header {
+        op: op[0],
+        seq,
+        aad,
+        payload_len,
+    })
 }
 
 /// Pending 2PC TLS 1.3 traffic-key derivation (notary holds full IKM for public IV oracle).
@@ -219,6 +225,7 @@ pub struct TwoPcTrafficSetup {
 /// Host: announce 2PC HKDF then derive client traffic key shares.
 pub fn client_run_2pc_traffic_hkdf(
     channel: &mut Channel,
+    session: &mut Wrk17ClientSession,
     ikm_c: [u8; 32],
     after_sh: [u8; 32],
     after_sf: [u8; 32],
@@ -233,7 +240,7 @@ pub fn client_run_2pc_traffic_hkdf(
         },
     )?;
     crate::hkdf::client_tls13_client_traffic_from_ikm_shares(
-        channel, ikm_c, after_sh, after_sf,
+        channel, ikm_c, after_sh, after_sf, session,
     )
 }
 
@@ -252,11 +259,13 @@ pub fn run_notary_worker_attested_2pc(
             header.op
         );
     }
+    let mut wrk17 = Wrk17NotarySession::init(channel)?;
     let traffic = crate::hkdf::notary_tls13_client_traffic_from_ikm_shares(
         channel,
         setup.ikm_n,
         setup.after_sh,
         setup.after_sf,
+        &mut wrk17,
     )?;
     let (_, iv_tx, _, iv_rx) = crate::hkdf::reference_tls13_client_traffic(
         &setup.ikm_full,
@@ -265,6 +274,7 @@ pub fn run_notary_worker_attested_2pc(
     );
     run_notary_worker_inner(
         channel,
+        &mut wrk17,
         Some(signing_key),
         traffic.k_n_tx,
         iv_tx,
@@ -283,8 +293,18 @@ pub fn run_notary_worker(
     k_n_rx: [u8; 16],
     iv_rx: [u8; 12],
 ) -> SwankyResult<()> {
-    run_notary_worker_inner(channel, None, k_n_tx, iv_tx, k_n_rx, iv_rx, SessionBinding::default())
-        .map(|_| ())
+    let mut wrk17 = Wrk17NotarySession::init(channel)?;
+    run_notary_worker_inner(
+        channel,
+        &mut wrk17,
+        None,
+        k_n_tx,
+        iv_tx,
+        k_n_rx,
+        iv_rx,
+        SessionBinding::default(),
+    )
+    .map(|_| ())
 }
 
 /// Like [`run_notary_worker`] but also tracks a session log and signs a
@@ -300,8 +320,10 @@ pub fn run_notary_worker_attested(
     iv_rx: [u8; 12],
     binding: SessionBinding,
 ) -> SwankyResult<Option<NotaryBundle>> {
+    let mut wrk17 = Wrk17NotarySession::init(channel)?;
     run_notary_worker_inner(
         channel,
+        &mut wrk17,
         Some(signing_key),
         k_n_tx,
         iv_tx,
@@ -311,8 +333,10 @@ pub fn run_notary_worker_attested(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_notary_worker_inner(
     channel: &mut Channel,
+    wrk17: &mut Wrk17NotarySession,
     signing_key: Option<&SigningKey>,
     k_n_tx: [u8; 16],
     iv_tx: [u8; 12],
@@ -335,6 +359,7 @@ fn run_notary_worker_inner(
                     nonce,
                     &header.aad,
                     header.payload_len as usize,
+                    wrk17,
                 )?;
                 let commit_hash = read_commit(channel, header.payload_len as usize)?;
                 records.push(RecordCommit {
@@ -352,6 +377,7 @@ fn run_notary_worker_inner(
                     nonce,
                     header.aad.len(),
                     header.payload_len as usize,
+                    wrk17,
                 )?;
                 let commit_hash = read_commit(channel, header.payload_len as usize)?;
                 records.push(RecordCommit {
@@ -411,10 +437,7 @@ fn run_notary_worker_inner(
                 channel.write_bytes(&(serialized.len() as u32).to_be_bytes())?;
                 channel.write_bytes(&serialized)?;
                 channel.force_flush().map_err(|e| {
-                    swanky_error::swanky_error!(
-                        swanky_error::ErrorKind::NetworkError,
-                        "flush: {e}"
-                    )
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "flush: {e}")
                 })?;
                 return Ok(Some(bundle));
             }
@@ -442,19 +465,22 @@ fn read_commit(channel: &mut Channel, payload_len: usize) -> SwankyResult<[u8; 3
     Ok(h.finalize().into())
 }
 
+type EncryptRespond = mpsc::SyncSender<Result<(Vec<u8>, [u8; 16]), String>>;
+type DecryptRespond = mpsc::SyncSender<Result<Vec<u8>, String>>;
+
 enum ClientJob {
     Encrypt {
         plaintext: Vec<u8>,
         aad: Vec<u8>,
         seq: u64,
-        respond: mpsc::SyncSender<Result<(Vec<u8>, [u8; 16]), String>>,
+        respond: EncryptRespond,
     },
     Decrypt {
         ciphertext: Vec<u8>,
         tag: [u8; 16],
         aad: Vec<u8>,
         seq: u64,
-        respond: mpsc::SyncSender<Result<Vec<u8>, String>>,
+        respond: DecryptRespond,
     },
     Shutdown,
 }
@@ -487,11 +513,17 @@ impl ClientWorker {
         let (tx, rx) = mpsc::sync_channel::<ClientJob>(1);
         let handle = thread::spawn(move || -> SwankyResult<()> {
             Channel::with(stream, |ch| -> SwankyResult<()> {
+                let mut wrk17 = Wrk17ClientSession::init(ch)?;
                 while let Ok(job) = rx.recv() {
                     match job {
-                        ClientJob::Encrypt { plaintext, aad, seq, respond } => {
+                        ClientJob::Encrypt {
+                            plaintext,
+                            aad,
+                            seq,
+                            respond,
+                        } => {
                             let result =
-                                encrypt_one(ch, k_c_tx, iv_tx, &plaintext, &aad, seq);
+                                encrypt_one(ch, &mut wrk17, k_c_tx, iv_tx, &plaintext, &aad, seq);
                             let _ = respond.send(result.map_err(|e| format!("{e:?}")));
                         }
                         ClientJob::Decrypt {
@@ -501,8 +533,16 @@ impl ClientWorker {
                             seq,
                             respond,
                         } => {
-                            let result =
-                                decrypt_one(ch, k_c_rx, iv_rx, &ciphertext, tag, &aad, seq);
+                            let result = decrypt_one(
+                                ch,
+                                &mut wrk17,
+                                k_c_rx,
+                                iv_rx,
+                                &ciphertext,
+                                tag,
+                                &aad,
+                                seq,
+                            );
                             let _ = respond.send(result.map_err(|e| format!("{e:?}")));
                         }
                         ClientJob::Shutdown => return Ok(()),
@@ -511,16 +551,23 @@ impl ClientWorker {
                 Ok(())
             })
         });
-        ClientWorker { jobs: tx, handle: Some(handle) }
+        ClientWorker {
+            jobs: tx,
+            handle: Some(handle),
+        }
     }
 
     /// Boxed rustls `MessageEncrypter`. Safe to plug into a rustls cipher suite.
     pub fn make_encrypter(&self) -> Box<dyn MessageEncrypter> {
-        Box::new(TwoPartyEncrypter { jobs: Mutex::new(self.jobs.clone()) })
+        Box::new(TwoPartyEncrypter {
+            jobs: Mutex::new(self.jobs.clone()),
+        })
     }
 
     pub fn make_decrypter(&self) -> Box<dyn MessageDecrypter> {
-        Box::new(TwoPartyDecrypter { jobs: Mutex::new(self.jobs.clone()) })
+        Box::new(TwoPartyDecrypter {
+            jobs: Mutex::new(self.jobs.clone()),
+        })
     }
 
     pub fn shutdown(mut self) -> SwankyResult<()> {
@@ -543,18 +590,21 @@ impl ClientWorker {
 /// payload_len), then runs the 2PC encrypt.
 pub fn client_encrypt_record(
     ch: &mut Channel,
+    session: &mut Wrk17ClientSession,
     k_c: [u8; 16],
     base_iv: [u8; 12],
     plaintext: &[u8],
     aad: &[u8],
     seq: u64,
 ) -> SwankyResult<(Vec<u8>, [u8; 16])> {
-    encrypt_one(ch, k_c, base_iv, plaintext, aad, seq)
+    encrypt_one(ch, session, k_c, base_iv, plaintext, aad, seq)
 }
 
 /// Decrypt one TLS record over a swanky channel paired with [`run_notary_worker`].
+#[allow(clippy::too_many_arguments)]
 pub fn client_decrypt_record(
     ch: &mut Channel,
+    session: &mut Wrk17ClientSession,
     k_c: [u8; 16],
     base_iv: [u8; 12],
     ciphertext: &[u8],
@@ -562,11 +612,12 @@ pub fn client_decrypt_record(
     aad: &[u8],
     seq: u64,
 ) -> SwankyResult<Vec<u8>> {
-    decrypt_one(ch, k_c, base_iv, ciphertext, tag, aad, seq)
+    decrypt_one(ch, session, k_c, base_iv, ciphertext, tag, aad, seq)
 }
 
 fn encrypt_one(
     ch: &mut Channel,
+    session: &mut Wrk17ClientSession,
     k_c: [u8; 16],
     base_iv: [u8; 12],
     plaintext: &[u8],
@@ -583,7 +634,7 @@ fn encrypt_one(
         },
     )?;
     let nonce = tls13_nonce(&base_iv, seq);
-    let (ct, tag) = client_encrypt_gcm(ch, k_c, plaintext, aad, nonce)?;
+    let (ct, tag) = client_encrypt_gcm(ch, k_c, plaintext, aad, nonce, session)?;
     // Send ciphertext + tag so the notary can commit to them in its log.
     ch.write_bytes(&ct)?;
     ch.write_bytes(&tag)?;
@@ -593,8 +644,10 @@ fn encrypt_one(
     Ok((ct, tag))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decrypt_one(
     ch: &mut Channel,
+    session: &mut Wrk17ClientSession,
     k_c: [u8; 16],
     base_iv: [u8; 12],
     ciphertext: &[u8],
@@ -612,7 +665,7 @@ fn decrypt_one(
         },
     )?;
     let nonce = tls13_nonce(&base_iv, seq);
-    let plaintext = client_decrypt_gcm_2pc(ch, k_c, ciphertext, aad, tag, nonce)?;
+    let plaintext = client_decrypt_gcm_2pc(ch, k_c, ciphertext, aad, tag, nonce, session)?;
     // Same commit: notary needs the same ct+tag bytes to compute the hash.
     ch.write_bytes(ciphertext)?;
     ch.write_bytes(&tag)?;
@@ -631,7 +684,12 @@ pub fn client_finish_session(
 ) -> SwankyResult<NotaryBundle> {
     write_header(
         ch,
-        &Header { op: OP_FINISH, seq: 0, aad: Vec::new(), payload_len: 0 },
+        &Header {
+            op: OP_FINISH,
+            seq: 0,
+            aad: Vec::new(),
+            payload_len: 0,
+        },
     )?;
     ch.write_bytes(&(session_id.len() as u16).to_be_bytes())?;
     ch.write_bytes(session_id.as_bytes())?;
@@ -750,15 +808,61 @@ impl MessageDecrypter for TwoPartyDecrypter {
     }
 }
 
+// ── swanky Channel ↔ std::io (for ECDH post-setup framing) ───────────────────
+
+/// `Read` / `Write` adapter for a swanky [`Channel`] (exact-length reads/writes).
+pub struct ChannelRw<'ch, 'stream>(pub &'ch mut Channel<'stream>);
+
+impl Read for ChannelRw<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.0
+            .read_bytes(buf)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        Ok(buf.len())
+    }
+}
+
+impl Write for ChannelRw<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .write_bytes(buf)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .force_flush()
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        Ok(())
+    }
+}
+
+/// After mode-1 IV setup: read host ECDH flag and run the selected round.
+pub fn notary_ecdh_after_setup_ivs(
+    ch: &mut Channel<'_>,
+    notary_share: &crate::ecdh::EphemeralShare,
+    rng: &mut impl rand::RngCore,
+) -> SwankyResult<crate::ecdh::EcdhSetupOutcome> {
+    use crate::ecdh::notary_recv_ecdh_setup;
+
+    let mut io = ChannelRw(ch);
+    notary_recv_ecdh_setup(&mut io, notary_share, rng)
+        .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aes;
+    use crate::garble::production_session_binding;
     use crate::hkdf::{
-        client_tls13_client_traffic_from_ikm_shares, notary_tls13_client_traffic_from_ikm_shares,
-        reference_tls13_client_traffic, xor16, xor32,
+        notary_tls13_client_traffic_from_ikm_shares, reference_tls13_client_traffic, xor16, xor32,
     };
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -770,6 +874,7 @@ mod tests {
 
     /// End-to-end demo of the standalone prover/notary primitives.
     #[test]
+    #[ignore = "WRK17 AES-GCM record; run with `cargo test --release split_key_record -- --ignored`"]
     fn split_key_record_round_trip() {
         let k_c = [0x60u8; 16];
         let k_n = [0x2bu8; 16];
@@ -783,19 +888,31 @@ mod tests {
         let notary = NotaryTlsSession::new(k_n, base_iv);
 
         let ((), (ct, tag)) = local_channel_pair(
-            |ch| notary.encrypt_record(ch, seq, plaintext.len(), aad),
-            |ch| prover.encrypt_record(ch, seq, plaintext, aad),
+            |ch| {
+                let mut session = Wrk17NotarySession::init(ch)?;
+                notary.encrypt_record(ch, &mut session, seq, plaintext.len(), aad)
+            },
+            |ch| {
+                let mut session = Wrk17ClientSession::init(ch)?;
+                prover.encrypt_record(ch, &mut session, seq, plaintext, aad)
+            },
         )
         .expect("2PC record encryption");
 
         use aes_gcm::{
-            aead::{Aead, KeyInit, Payload},
             Aes128Gcm, Key, Nonce,
+            aead::{Aead, KeyInit, Payload},
         };
         let nonce = tls13_nonce(&base_iv, seq);
         let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&k));
         let reference = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .unwrap();
         assert_eq!(ct, &reference[..plaintext.len()]);
         assert_eq!(tag.as_slice(), &reference[plaintext.len()..]);
@@ -809,9 +926,14 @@ mod tests {
         let nonce = [0xaau8; 12];
         let plaintext = b"server response body";
 
-        use aes_gcm::{aead::{Aead, KeyInit}, Aes128Gcm, Key, Nonce};
+        use aes_gcm::{
+            Aes128Gcm, Key, Nonce,
+            aead::{Aead, KeyInit},
+        };
         let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&k));
-        let server_ct = cipher.encrypt(Nonce::from_slice(&nonce), plaintext.as_ref()).unwrap();
+        let server_ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .unwrap();
 
         let notary = NotaryTlsSession::new(k_n, [0u8; 12]);
         let signing_key = b"notary-long-term-ed25519-or-hmac";
@@ -829,6 +951,7 @@ mod tests {
     /// directly (without a real rustls stack), and check the output matches
     /// the `aes-gcm` crate's TLS 1.3 record encryption.
     #[test]
+    #[ignore = "WRK17 record worker over TCP; run with `cargo test --release rustls_bridge -- --ignored`"]
     fn rustls_bridge_encrypt_decrypt_round_trip() {
         let k_n = [0x2bu8; 16];
         let k_c = [0x60u8; 16];
@@ -838,8 +961,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let notary_handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let _ =
-                Channel::with(stream, |ch| run_notary_worker(ch, k_n, base_iv, k_n, base_iv));
+            let _ = Channel::with(stream, |ch| {
+                run_notary_worker(ch, k_n, base_iv, k_n, base_iv)
+            });
         });
 
         let stream = TcpStream::connect(addr).unwrap();
@@ -865,8 +989,8 @@ mod tests {
 
         // Independent reference: AES-128-GCM with K = K_N XOR K_C
         use aes_gcm::{
-            aead::{Aead, KeyInit, Payload},
             Aes128Gcm, Key, Nonce,
+            aead::{Aead, KeyInit, Payload},
         };
         let k = xor_keys(k_n, k_c);
         let nonce = tls13_nonce(&base_iv, seq);
@@ -877,7 +1001,10 @@ mod tests {
         let reference = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
-                Payload { msg: &inner_to_encrypt, aad: &aad },
+                Payload {
+                    msg: &inner_to_encrypt,
+                    aad: &aad,
+                },
             )
             .unwrap();
         assert_eq!(record_payload, &reference[..]);
@@ -906,6 +1033,7 @@ mod tests {
     ///   - OP_FINISH frame + bincode bundle round-trip
     ///   - Ed25519 signature verification
     #[test]
+    #[ignore = "WRK17 attested encrypt+decrypt; run with `cargo test --release notary_bundle -- --ignored`"]
     fn notary_bundle_round_trip() {
         use ed25519_dalek::SigningKey;
         use rand::RngCore;
@@ -939,8 +1067,9 @@ mod tests {
                 // per direction so seqs are independent; this test isn't TLS).
                 let pt = b"hello, attested world";
                 let aad = b"record-aad";
-                let (ct, tag) = encrypt_one(ch, k_c, iv, pt, aad, 0)?;
-                let plain = decrypt_one(ch, k_c, iv, &ct, tag, aad, 0)?;
+                let mut wrk17 = Wrk17ClientSession::init(ch)?;
+                let (ct, tag) = encrypt_one(ch, &mut wrk17, k_c, iv, pt, aad, 0)?;
+                let plain = decrypt_one(ch, &mut wrk17, k_c, iv, &ct, tag, aad, 0)?;
                 assert_eq!(plain, pt);
                 client_finish_session(ch, "test-session-1", "test.example.com")
             },
@@ -976,7 +1105,7 @@ mod tests {
         );
         assert_eq!(
             client_bundle.binding.garbling_mode,
-            crate::circuits::GARBLING_GCM_AES_AUTH
+            crate::circuits::GARBLING_FULL_AUTH
         );
 
         // Tampering breaks verification
@@ -991,6 +1120,7 @@ mod tests {
 
     /// 2PC HKDF over TCP — both peers use [`Channel::with`] from connect (no setup preamble).
     #[test]
+    #[ignore = "full TLS 1.3 WRK17 HKDF schedule (~hours); run with `cargo test --release hkdf_over -- --ignored`"]
     fn hkdf_over_tcp_with_op_header() {
         let ikm: [u8; 32] = [0x5a; 32];
         let ikm_n = [0xa1u8; 32];
@@ -1007,15 +1137,18 @@ mod tests {
             Channel::with(s, |ch| {
                 let h = read_header(ch)?;
                 assert_eq!(h.op, OP_2PC_HKDF);
-                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+                let mut s = Wrk17NotarySession::init(ch)?;
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf, &mut s)
             })
         });
 
         let client = TcpStream::connect(addr).unwrap();
         client.set_nodelay(true).unwrap();
-        let c_shares =
-            Channel::with(client, |ch| client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf))
-                .unwrap();
+        let c_shares = Channel::with(client, |ch| {
+            let mut s = Wrk17ClientSession::init(ch)?;
+            client_run_2pc_traffic_hkdf(ch, &mut s, ikm_c, after_sh, after_sf)
+        })
+        .unwrap();
 
         let n_shares = notary_h.join().unwrap().unwrap();
         assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
@@ -1025,6 +1158,7 @@ mod tests {
     /// Mode-2 wire shape: raw host setup + second [`Channel::with`] for HKDF works
     /// once ECDH sends a stable host scalar encoding and notary derives TLS IKM.
     #[test]
+    #[ignore = "full TLS 1.3 WRK17 HKDF schedule (~hours); run with `cargo test --release hkdf_over -- --ignored`"]
     fn hkdf_over_tcp_after_raw_host_preamble() {
         use crate::ecdh::{
             generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup, reference_ikm,
@@ -1060,12 +1194,19 @@ mod tests {
                 assert_eq!(&transcript[..32], &after_sh);
                 assert_eq!(&transcript[32..], &after_sf);
                 let mut io = ChannelRw(ch);
-                let outcome = notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
-                    .map_err(|e| {
-                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
-                    })?;
+                let outcome =
+                    notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
+                        .map_err(|e| {
+                            swanky_error::swanky_error!(
+                                swanky_error::ErrorKind::NetworkError,
+                                "{e}"
+                            )
+                        })?;
                 ch.force_flush().map_err(|e| {
-                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+                    swanky_error::swanky_error!(
+                        swanky_error::ErrorKind::NetworkError,
+                        "post-ECDH flush: {e}"
+                    )
                 })?;
                 let ikm_n = match outcome {
                     crate::ecdh::EcdhSetupOutcome::Ot(o) => o.notary_ikm_share,
@@ -1073,7 +1214,8 @@ mod tests {
                 };
                 let h = read_header(ch)?;
                 assert_eq!(h.op, OP_2PC_HKDF);
-                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+                let mut s = Wrk17NotarySession::init(ch)?;
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf, &mut s)
             })
         });
 
@@ -1090,7 +1232,8 @@ mod tests {
 
         let ikm_c = outcome.host_ikm_share;
         let c_shares = Channel::with(&mut stream, |ch| {
-            client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)
+            let mut s = Wrk17ClientSession::init(ch)?;
+            client_run_2pc_traffic_hkdf(ch, &mut s, ikm_c, after_sh, after_sf)
         })
         .unwrap();
 
@@ -1104,6 +1247,7 @@ mod tests {
 
     /// Setup bytes (no ECDH) then HKDF on one continuous channel per peer.
     #[test]
+    #[ignore = "full TLS 1.3 WRK17 HKDF schedule (~hours); run with `cargo test --release hkdf_over -- --ignored`"]
     fn hkdf_over_tcp_after_setup_preamble_only() {
         let ikm_n = [0xa1u8; 32];
         let ikm_c = [0x5eu8; 32];
@@ -1129,7 +1273,8 @@ mod tests {
                 ch.read_bytes(&mut transcript)?;
                 let h = read_header(ch)?;
                 assert_eq!(h.op, OP_2PC_HKDF);
-                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+                let mut s = Wrk17NotarySession::init(ch)?;
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf, &mut s)
             })
         });
 
@@ -1141,7 +1286,8 @@ mod tests {
             ch.read_bytes(&mut scalar)?;
             ch.write_bytes(&after_sh)?;
             ch.write_bytes(&after_sf)?;
-            client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)
+            let mut s = Wrk17ClientSession::init(ch)?;
+            client_run_2pc_traffic_hkdf(ch, &mut s, ikm_c, after_sh, after_sf)
         })
         .unwrap();
 
@@ -1153,6 +1299,7 @@ mod tests {
 
     /// ECDH over channel then HKDF in-process (isolates TCP from garbling desync).
     #[test]
+    #[ignore = "full TLS 1.3 WRK17 HKDF schedule (~hours); run with `cargo test --release hkdf_over -- --ignored`"]
     fn hkdf_over_local_after_ecdh_on_channel() {
         use crate::ecdh::{
             generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup, reference_ikm,
@@ -1170,10 +1317,14 @@ mod tests {
         let (n_result, c_result) = local_channel_pair(
             |ch| -> SwankyResult<_> {
                 let mut io = ChannelRw(ch);
-                let outcome = notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
-                    .map_err(|e| {
-                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
-                    })?;
+                let outcome =
+                    notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
+                        .map_err(|e| {
+                            swanky_error::swanky_error!(
+                                swanky_error::ErrorKind::NetworkError,
+                                "{e}"
+                            )
+                        })?;
                 ch.force_flush().map_err(|e| {
                     swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
                 })?;
@@ -1183,20 +1334,24 @@ mod tests {
                 };
                 let h = read_header(ch)?;
                 assert_eq!(h.op, OP_2PC_HKDF);
-                let shares =
-                    notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)?;
+                let mut s = Wrk17NotarySession::init(ch)?;
+                let shares = notary_tls13_client_traffic_from_ikm_shares(
+                    ch, ikm_n, after_sh, after_sf, &mut s,
+                )?;
                 Ok((shares, ikm_n))
             },
             |ch| -> SwankyResult<_> {
                 let mut io = ChannelRw(ch);
-                let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
-                    .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+                let outcome =
+                    host_send_ecdh_ot(&mut io, &host_share, &server_epk).map_err(|e| {
+                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                    })?;
                 ch.force_flush().map_err(|e| {
                     swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
                 })?;
                 let ikm_c = outcome.host_ikm_share;
-                let shares =
-                    client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)?;
+                let mut s = Wrk17ClientSession::init(ch)?;
+                let shares = client_run_2pc_traffic_hkdf(ch, &mut s, ikm_c, after_sh, after_sf)?;
                 Ok((shares, ikm_c))
             },
         )
@@ -1204,7 +1359,11 @@ mod tests {
         let (n_shares, notary_ikm_n) = n_result;
         let (c_shares, host_ikm_c) = c_result;
 
-        assert_eq!(xor32(notary_ikm_n, host_ikm_c), ikm_full, "OT ECDH IKM shares");
+        assert_eq!(
+            xor32(notary_ikm_n, host_ikm_c),
+            ikm_full,
+            "OT ECDH IKM shares"
+        );
 
         let (ref_tx, _, ref_rx, _) =
             reference_tls13_client_traffic(&ikm_full, &after_sh, &after_sf);
@@ -1214,6 +1373,7 @@ mod tests {
 
     /// After ECDH on a channel, HKDF with **fixed** IKM shares (not ECDH output).
     #[test]
+    #[ignore = "full TLS 1.3 WRK17 HKDF schedule (~hours); run with `cargo test --release hkdf_over -- --ignored`"]
     fn hkdf_over_local_after_ecdh_with_fixed_ikm() {
         use crate::ecdh::{generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup};
         use x25519_dalek::{PublicKey, StaticSecret};
@@ -1240,16 +1400,19 @@ mod tests {
                 })?;
                 let h = read_header(ch)?;
                 assert_eq!(h.op, OP_2PC_HKDF);
-                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+                let mut s = Wrk17NotarySession::init(ch)?;
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf, &mut s)
             },
             |ch| -> SwankyResult<_> {
                 let mut io = ChannelRw(ch);
-                let _ = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
-                    .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
+                let _ = host_send_ecdh_ot(&mut io, &host_share, &server_epk).map_err(|e| {
+                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
+                })?;
                 ch.force_flush().map_err(|e| {
                     swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
                 })?;
-                client_run_2pc_traffic_hkdf(ch, ikm_c, after_sh, after_sf)
+                let mut s = Wrk17ClientSession::init(ch)?;
+                client_run_2pc_traffic_hkdf(ch, &mut s, ikm_c, after_sh, after_sf)
             },
         )
         .unwrap();
@@ -1261,6 +1424,7 @@ mod tests {
 
     /// Correct mode-2 pattern: one continuous [`Channel::with`] on the host (setup + HKDF).
     #[test]
+    #[ignore = "full TLS 1.3 WRK17 HKDF schedule (~hours); run with `cargo test --release hkdf_over -- --ignored`"]
     fn hkdf_over_tcp_single_host_channel() {
         use crate::ecdh::{
             generate_share, host_send_ecdh_ot, notary_recv_ecdh_setup, reference_ikm,
@@ -1293,12 +1457,19 @@ mod tests {
                 let mut transcript = [0u8; 64];
                 ch.read_bytes(&mut transcript)?;
                 let mut io = ChannelRw(ch);
-                let outcome = notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
-                    .map_err(|e| {
-                        swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
-                    })?;
+                let outcome =
+                    notary_recv_ecdh_setup(&mut io, &notary_share, &mut rand::thread_rng())
+                        .map_err(|e| {
+                            swanky_error::swanky_error!(
+                                swanky_error::ErrorKind::NetworkError,
+                                "{e}"
+                            )
+                        })?;
                 ch.force_flush().map_err(|e| {
-                    swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+                    swanky_error::swanky_error!(
+                        swanky_error::ErrorKind::NetworkError,
+                        "post-ECDH flush: {e}"
+                    )
                 })?;
                 let ikm_n = match outcome {
                     crate::ecdh::EcdhSetupOutcome::Ot(o) => o.notary_ikm_share,
@@ -1306,7 +1477,8 @@ mod tests {
                 };
                 let h = read_header(ch)?;
                 assert_eq!(h.op, OP_2PC_HKDF);
-                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf)
+                let mut s = Wrk17NotarySession::init(ch)?;
+                notary_tls13_client_traffic_from_ikm_shares(ch, ikm_n, after_sh, after_sf, &mut s)
             })
         });
 
@@ -1319,12 +1491,17 @@ mod tests {
             ch.write_bytes(&after_sh)?;
             ch.write_bytes(&after_sf)?;
             let mut io = ChannelRw(ch);
-            let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk)
-                .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))?;
-            ch.force_flush().map_err(|e| {
-                swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "post-ECDH flush: {e}")
+            let outcome = host_send_ecdh_ot(&mut io, &host_share, &server_epk).map_err(|e| {
+                swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}")
             })?;
-            client_run_2pc_traffic_hkdf(ch, outcome.host_ikm_share, after_sh, after_sf)
+            ch.force_flush().map_err(|e| {
+                swanky_error::swanky_error!(
+                    swanky_error::ErrorKind::NetworkError,
+                    "post-ECDH flush: {e}"
+                )
+            })?;
+            let mut s = Wrk17ClientSession::init(ch)?;
+            client_run_2pc_traffic_hkdf(ch, &mut s, outcome.host_ikm_share, after_sh, after_sf)
         })
         .unwrap();
 
@@ -1335,50 +1512,4 @@ mod tests {
         assert_eq!(xor16(n_shares.k_n_tx, c_shares.k_c_tx), ref_tx);
         assert_eq!(xor16(n_shares.k_n_rx, c_shares.k_c_rx), ref_rx);
     }
-}
-
-// ── swanky Channel ↔ std::io (for ECDH post-setup framing) ───────────────────
-
-/// `Read` / `Write` adapter for a swanky [`Channel`] (exact-length reads/writes).
-pub struct ChannelRw<'ch, 'stream>(pub &'ch mut Channel<'stream>);
-
-impl Read for ChannelRw<'_, '_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        self.0
-            .read_bytes(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
-        Ok(buf.len())
-    }
-}
-
-impl Write for ChannelRw<'_, '_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .write_bytes(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0
-            .force_flush()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
-        Ok(())
-    }
-}
-
-/// After mode-1 IV setup: read host ECDH flag and run the selected round.
-pub fn notary_ecdh_after_setup_ivs(
-    ch: &mut Channel<'_>,
-    notary_share: &crate::ecdh::EphemeralShare,
-    rng: &mut impl rand::RngCore,
-) -> SwankyResult<crate::ecdh::EcdhSetupOutcome> {
-    use crate::ecdh::notary_recv_ecdh_setup;
-
-    let mut io = ChannelRw(ch);
-    notary_recv_ecdh_setup(&mut io, notary_share, rng)
-        .map_err(|e| swanky_error::swanky_error!(swanky_error::ErrorKind::NetworkError, "{e}"))
 }

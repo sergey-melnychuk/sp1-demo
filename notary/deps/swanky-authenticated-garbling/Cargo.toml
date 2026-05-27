@@ -1,0 +1,22 @@
+[package]
+name = "swanky-authenticated-garbling"
+description = "Authenticated malicious garbling (vendored patch for OT session reuse)"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fancy-garbling          = { git = "https://github.com/GaloisInc/swanky", package = "fancy-garbling" }
+swanky-authenticated-bits = { git = "https://github.com/GaloisInc/swanky", package = "swanky-authenticated-bits" }
+swanky-field            = { git = "https://github.com/GaloisInc/swanky", package = "swanky-field" }
+swanky-field-binary     = { git = "https://github.com/GaloisInc/swanky", package = "swanky-field-binary" }
+swanky-channel          = { git = "https://github.com/GaloisInc/swanky", package = "swanky-channel" }
+swanky-party            = { git = "https://github.com/GaloisInc/swanky", package = "swanky-party" }
+swanky-rng              = { git = "https://github.com/GaloisInc/swanky", package = "swanky-rng" }
+swanky-error            = { git = "https://github.com/GaloisInc/swanky", package = "swanky-error" }
+vectoreyes              = { git = "https://github.com/GaloisInc/swanky", package = "vectoreyes" }
+rand                    = "0.8"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"

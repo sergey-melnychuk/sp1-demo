@@ -65,11 +65,21 @@ impl Builder {
         // Build a constant-zero and constant-one wire from input bit 0.
         // zero = XOR(input[0], input[0])
         let z = b.alloc_wire();
-        b.gates.push(Gate { kind: GateKind::Xor, in1: 0, in2: 0, out: z });
+        b.gates.push(Gate {
+            kind: GateKind::Xor,
+            in1: 0,
+            in2: 0,
+            out: z,
+        });
         b.zero = z;
         // one = INV(zero)
         let o = b.alloc_wire();
-        b.gates.push(Gate { kind: GateKind::Inv, in1: z, in2: 0, out: o });
+        b.gates.push(Gate {
+            kind: GateKind::Inv,
+            in1: z,
+            in2: 0,
+            out: o,
+        });
         b.one = o;
         b
     }
@@ -82,28 +92,43 @@ impl Builder {
 
     fn xor(&mut self, a: usize, b: usize) -> usize {
         let out = self.alloc_wire();
-        self.gates.push(Gate { kind: GateKind::Xor, in1: a, in2: b, out });
+        self.gates.push(Gate {
+            kind: GateKind::Xor,
+            in1: a,
+            in2: b,
+            out,
+        });
         out
     }
 
     fn and(&mut self, a: usize, b: usize) -> usize {
         let out = self.alloc_wire();
-        self.gates.push(Gate { kind: GateKind::And, in1: a, in2: b, out });
+        self.gates.push(Gate {
+            kind: GateKind::And,
+            in1: a,
+            in2: b,
+            out,
+        });
         out
     }
 
     fn inv(&mut self, a: usize) -> usize {
         let out = self.alloc_wire();
-        self.gates.push(Gate { kind: GateKind::Inv, in1: a, in2: 0, out });
+        self.gates.push(Gate {
+            kind: GateKind::Inv,
+            in1: a,
+            in2: 0,
+            out,
+        });
         out
     }
 
     fn constant_u32(&mut self, value: u32) -> [usize; 32] {
         // MSB-first: result[0] = bit 31, result[31] = bit 0
         let mut out = [0usize; 32];
-        for i in 0..32 {
+        for (i, out_i) in out.iter_mut().enumerate() {
             let bit = (value >> (31 - i)) & 1;
-            out[i] = if bit == 1 { self.one } else { self.zero };
+            *out_i = if bit == 1 { self.one } else { self.zero };
         }
         out
     }
@@ -119,7 +144,12 @@ impl Builder {
         for &ow in output_wires {
             let new = next_wire;
             next_wire += 1;
-            gates.push(Gate { kind: GateKind::Xor, in1: ow, in2: self.zero, out: new });
+            gates.push(Gate {
+                kind: GateKind::Xor,
+                in1: ow,
+                in2: self.zero,
+                out: new,
+            });
             final_outputs.push(new);
         }
 
@@ -144,8 +174,8 @@ type U32 = [usize; 32];
 
 fn input_word(start_wire: usize) -> U32 {
     let mut out = [0usize; 32];
-    for i in 0..32 {
-        out[i] = start_wire + i;
+    for (i, out_i) in out.iter_mut().enumerate() {
+        *out_i = start_wire + i;
     }
     out
 }
@@ -283,13 +313,13 @@ fn build_compression() -> (Builder, Vec<usize>) {
 
     // Parse the 256-bit IV into 8 u32 words (MSB-first within each word).
     let mut h: [U32; 8] = [[0; 32]; 8];
-    for i in 0..8 {
-        h[i] = input_word(i * 32);
+    for (i, h_i) in h.iter_mut().enumerate() {
+        *h_i = input_word(i * 32);
     }
     // Parse the 512-bit message into 16 u32 words.
     let mut w: [U32; 64] = [[0; 32]; 64];
-    for i in 0..16 {
-        w[i] = input_word(256 + i * 32);
+    for (i, w_i) in w.iter_mut().take(16).enumerate() {
+        *w_i = input_word(256 + i * 32);
     }
 
     // Message schedule W[16..64]
@@ -365,8 +395,8 @@ fn validate(circ_bytes: &[u8]) -> Result<(), String> {
     // Test vector: empty SHA-256 compress (one block of all-zero input with std IV).
     // Standard SHA-256 IV (FIPS 180-4)
     let iv: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
 
     // Try a deterministic input: IV = std IV, M = "abc" + standard SHA-256 padding
@@ -386,8 +416,7 @@ fn validate(circ_bytes: &[u8]) -> Result<(), String> {
     let expected_hex: String = state.iter().map(|w| format!("{:08x}", w)).collect();
     // Known: SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
     assert_eq!(
-        expected_hex,
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        expected_hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         "sanity: sha2::compress256 for SHA-256(\"abc\") should match the known digest"
     );
 

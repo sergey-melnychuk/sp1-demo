@@ -83,7 +83,7 @@ pub fn combined_client_esk(host: &EphemeralShare, notary: &EphemeralShare) -> [u
 pub fn compute_partial_point(share: &EphemeralShare, server_epk: &[u8; 32]) -> EdwardsPoint {
     let mont = MontgomeryPoint(*server_epk);
     let edwards = mont.to_edwards(0).expect("valid server epk");
-    &share.scalar * edwards
+    share.scalar * edwards
 }
 
 /// After exchanging partial points `P_c` and `P_n` in cleartext — **both learn full IKM**.
@@ -545,7 +545,7 @@ pub fn reference_ikm(
     let esk_scalar = Scalar::from_bytes_mod_order(esk);
     let mont = MontgomeryPoint(*server_epk);
     let server_ed = mont.to_edwards(0).expect("valid server epk");
-    X25519SharedSecret((&esk_scalar * server_ed).to_montgomery().0)
+    X25519SharedSecret((esk_scalar * server_ed).to_montgomery().0)
 }
 
 #[cfg(test)]
@@ -558,7 +558,7 @@ mod tests {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let mut rng = OsRng;
-        let server_secret = StaticSecret::random_from_rng(&mut rng);
+        let server_secret = StaticSecret::random_from_rng(rng);
         let server_public = PublicKey::from(&server_secret);
 
         let k_c = generate_share(&mut rng);
@@ -572,7 +572,7 @@ mod tests {
         let summed = k_c.scalar + k_n.scalar;
         let server_mont = MontgomeryPoint(*server_public.as_bytes());
         let server_ed = server_mont.to_edwards(0).expect("valid server epk");
-        let expected = (&summed * server_ed).to_montgomery();
+        let expected = (summed * server_ed).to_montgomery();
 
         assert_eq!(
             got.0, expected.0,
@@ -586,18 +586,14 @@ mod tests {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let mut rng = OsRng;
-        let server_sk = StaticSecret::random_from_rng(&mut rng);
+        let server_sk = StaticSecret::random_from_rng(rng);
         let server_epk = *PublicKey::from(&server_sk).as_bytes();
         let k_c = generate_share(&mut rng);
         let k_n = generate_share(&mut rng);
         let expect = reference_ikm(&k_c, &k_n, &server_epk);
         let again = reference_ikm(&k_c, &k_n, &server_epk);
         assert_eq!(expect.0, again.0);
-        let from_wire = reference_ikm(
-            &share_from_bytes(&share_to_bytes(&k_c)),
-            &k_n,
-            &server_epk,
-        );
+        let from_wire = reference_ikm(&share_from_bytes(&share_to_bytes(&k_c)), &k_n, &server_epk);
         assert_eq!(expect.0, from_wire.0);
     }
 
@@ -609,7 +605,7 @@ mod tests {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let mut rng = OsRng;
-        let server_sk = StaticSecret::random_from_rng(&mut rng);
+        let server_sk = StaticSecret::random_from_rng(rng);
         let server_epk = *PublicKey::from(&server_sk).as_bytes();
 
         let k_c = generate_share(&mut rng);
@@ -641,7 +637,7 @@ mod tests {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let mut rng = OsRng;
-        let server_sk = StaticSecret::random_from_rng(&mut rng);
+        let server_sk = StaticSecret::random_from_rng(rng);
         let server_epk = *PublicKey::from(&server_sk).as_bytes();
 
         let k_c = generate_share(&mut rng);
@@ -669,20 +665,14 @@ mod tests {
         }
 
         let notary = std::thread::spawn(move || {
-            let mut io = Duplex {
-                r: n2h_r,
-                w: h2n_w,
-            };
+            let mut io = Duplex { r: n2h_r, w: h2n_w };
             match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
                 EcdhSetupOutcome::Leaky(o) => o,
                 _ => panic!("expected leaky ECDH"),
             }
         });
 
-        let mut host_io = Duplex {
-            r: h2n_r,
-            w: n2h_w,
-        };
+        let mut host_io = Duplex { r: h2n_r, w: n2h_w };
         let host_out = host_send_ecdh_leaky(&mut host_io, &k_c, &k_n, &server_epk).unwrap();
         let notary_out = notary.join().unwrap();
 
@@ -702,7 +692,7 @@ mod tests {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let mut rng = OsRng;
-        let server_sk = StaticSecret::random_from_rng(&mut rng);
+        let server_sk = StaticSecret::random_from_rng(rng);
         let server_epk = *PublicKey::from(&server_sk).as_bytes();
 
         let k_c = generate_share(&mut rng);
@@ -730,29 +720,22 @@ mod tests {
         }
 
         let notary = std::thread::spawn(move || {
-            let mut io = Duplex {
-                r: n2h_r,
-                w: h2n_w,
-            };
+            let mut io = Duplex { r: n2h_r, w: h2n_w };
             match notary_recv_ecdh_setup(&mut io, &k_n, &mut rng).unwrap() {
                 EcdhSetupOutcome::Ot(o) => o,
                 _ => panic!("expected OT ECDH"),
             }
         });
 
-        let mut host_io = Duplex {
-            r: h2n_r,
-            w: n2h_w,
-        };
+        let mut host_io = Duplex { r: h2n_r, w: n2h_w };
         let host_out = host_send_ecdh_ot(&mut host_io, &k_c, &server_epk).unwrap();
         let notary_out = notary.join().unwrap();
 
         let expect = reference_ikm(&k_c, &k_n, &server_epk);
         assert_eq!(notary_out.ikm.0, expect.0);
         assert_eq!(host_out.host_ikm_share, notary_out.host_ikm_share);
-        let recon: [u8; 32] = std::array::from_fn(|i| {
-            notary_out.host_ikm_share[i] ^ notary_out.notary_ikm_share[i]
-        });
+        let recon: [u8; 32] =
+            std::array::from_fn(|i| notary_out.host_ikm_share[i] ^ notary_out.notary_ikm_share[i]);
         assert_eq!(recon, expect.0);
     }
 }

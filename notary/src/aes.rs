@@ -4,8 +4,9 @@
 //! Client  = Evaluator — holds K_c
 //! K = K_n XOR K_c (never assembled in the clear)
 //!
-//! **Garbling split:** each AES block runs in its own WRK17 session; GHASH (AND-heavy)
-//! stays on one semi-honest garbler/evaluator pair per encrypt/decrypt.
+//! **Garbling split:** each AES block runs in its own WRK17 session; the full GHASH
+//! chain for a record runs in one unrolled WRK17 session. OT extension is reused via
+//! [`crate::garble::Wrk17NotarySession`] / [`crate::garble::Wrk17ClientSession`].
 
 use fancy_garbling::{
     Fancy, FancyBinary, WireMod2,
@@ -16,6 +17,11 @@ use swanky_error::Result as SwankyResult;
 use swanky_ot_chou_orlandi::{Receiver as OtReceiver, Sender as OtSender};
 use swanky_rng::SwankyRng;
 use swanky_twopac::semihonest::{Evaluator, Garbler};
+
+use crate::garble::{Wrk17ClientSession, Wrk17NotarySession};
+use crate::ghash::{
+    client_ghash_chain_wrk17, ct_eq16, notary_ghash_chain_wrk17, xor_bytes16, zero_pad_block,
+};
 
 // ── circuit ───────────────────────────────────────────────────────────────────
 
@@ -39,11 +45,12 @@ fn notary_aes_block_wrk17(
     channel: &mut Channel,
     block_n: [u8; 16],
     key_n: [u8; 16],
+    session: &mut Wrk17NotarySession,
 ) -> SwankyResult<[u8; 16]> {
     let circ = aes_wrk17_circuit();
     let mut gb_bits = bytes_to_bits(&block_n);
     gb_bits.extend(bytes_to_bits(&key_n));
-    let mask = crate::garble::wrk17_notary_masked_run(channel, &circ, &gb_bits)?;
+    let mask = crate::garble::wrk17_notary_masked_run(channel, &circ, &gb_bits, session)?;
     let mut out = [0u8; 16];
     out.copy_from_slice(&mask);
     Ok(out)
@@ -54,11 +61,12 @@ fn client_aes_block_wrk17(
     channel: &mut Channel,
     block_c: [u8; 16],
     key_c: [u8; 16],
+    session: &mut Wrk17ClientSession,
 ) -> SwankyResult<[u8; 16]> {
     let circ = aes_wrk17_circuit();
     let mut ev_bits = bytes_to_bits(&block_c);
     ev_bits.extend(bytes_to_bits(&key_c));
-    let share = crate::garble::wrk17_client_masked_run(channel, &circ, &ev_bits)?;
+    let share = crate::garble::wrk17_client_masked_run(channel, &circ, &ev_bits, session)?;
     let mut out = [0u8; 16];
     out.copy_from_slice(&share);
     Ok(out)
@@ -144,7 +152,9 @@ pub fn client_encrypt_block(
         ct_bits.push(ev.xor(&pt_bits[i], &keystream[i]));
     }
 
-    let ct_vals = ev.outputs(&ct_bits, channel)?.expect("evaluator receives output");
+    let ct_vals = ev
+        .outputs(&ct_bits, channel)?
+        .expect("evaluator receives output");
     Ok(bits_to_bytes_16(ct_vals))
 }
 
@@ -165,50 +175,6 @@ pub fn client_encrypt(
     Ok(ciphertext)
 }
 
-// ── GCM helpers (semi-honest GHASH) ───────────────────────────────────────────
-
-fn xor_blocks<F: FancyBinary>(f: &mut F, a: &[F::Item], b: &[F::Item]) -> Vec<F::Item> {
-    let mut out = Vec::with_capacity(a.len());
-    for i in 0..a.len() {
-        out.push(f.xor(&a[i], &b[i]));
-    }
-    out
-}
-
-fn ghash_mul<F: FancyBinary>(
-    f: &mut F,
-    channel: &mut Channel,
-    x: &[F::Item],
-    y: &[F::Item],
-) -> SwankyResult<Vec<F::Item>>
-where
-    F::Item: Clone,
-{
-    let zero = f.constant(0, 2, channel)?;
-    let mut z: Vec<F::Item> = (0..128).map(|_| zero.clone()).collect();
-    let mut v: Vec<F::Item> = y.to_vec();
-
-    for i in 0..128 {
-        for j in 0..128 {
-            let xv = f.and(&x[i], &v[j], channel)?;
-            let new_zj = f.xor(&z[j], &xv);
-            z[j] = new_zj;
-        }
-        let lsb = v[127].clone();
-        let mut new_v = Vec::with_capacity(128);
-        new_v.push(zero.clone());
-        for k in 0..127 {
-            new_v.push(v[k].clone());
-        }
-        v = new_v;
-        for &r in &[0usize, 1, 2, 7] {
-            let new_vr = f.xor(&v[r], &lsb);
-            v[r] = new_vr;
-        }
-    }
-    Ok(z)
-}
-
 // ── split-key AES-GCM (notary / client) ───────────────────────────────────────
 
 pub fn notary_encrypt_gcm(
@@ -217,72 +183,50 @@ pub fn notary_encrypt_gcm(
     nonce: [u8; 12],
     aad: &[u8],
     plaintext_len: usize,
+    session: &mut Wrk17NotarySession,
 ) -> SwankyResult<()> {
-    let rng = SwankyRng::new();
-    let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
-    let mod2 = vec![2u16; 128];
-
     let n_aad_blocks = aad.len().div_ceil(16);
     let n_pt_blocks = plaintext_len.div_ceil(16);
-    let pt_last_bytes = if plaintext_len == 0 { 0 } else { ((plaintext_len - 1) % 16) + 1 };
+    let pt_last_bytes = if plaintext_len == 0 {
+        0
+    } else {
+        ((plaintext_len - 1) % 16) + 1
+    };
 
-    // H and S via WRK17; import XOR-shares into the semi-honest GHASH session.
-    let h_n = notary_aes_block_wrk17(channel, [0u8; 16], k_n)?;
-    let h_bits = crate::garble::semi_gb_split_bytes(&mut gb, channel, &h_n)?;
-
+    let h_n = notary_aes_block_wrk17(channel, [0u8; 16], k_n, session)?;
     let j0 = make_nonce_ctr(nonce, 1);
-    let s_n = notary_aes_block_wrk17(channel, j0, k_n)?;
-    let s_bits = crate::garble::semi_gb_split_bytes(&mut gb, channel, &s_n)?;
+    let s_n = notary_aes_block_wrk17(channel, j0, k_n, session)?;
 
-    let zero = gb.constant(0, 2, channel)?;
-    let mut x_acc: Vec<WireMod2> = (0..128).map(|_| zero.clone()).collect();
+    let mut ghash_blocks_n = Vec::with_capacity(n_aad_blocks + n_pt_blocks + 1);
 
     for blk in 0..n_aad_blocks {
         let mut aad_block = [0u8; 16];
         let start = blk * 16;
         let end = ((blk + 1) * 16).min(aad.len());
         aad_block[..end - start].copy_from_slice(&aad[start..end]);
-        let aad_bits = gb.encode_many(&bytes_to_bits(&aad_block), &mod2, channel)?;
-        let xored = xor_blocks(&mut gb, &x_acc, &aad_bits);
-        x_acc = ghash_mul(&mut gb, channel, &xored, &h_bits)?;
+        ghash_blocks_n.push(aad_block);
     }
 
-    let mut ct_blocks: Vec<(Vec<WireMod2>, usize)> = Vec::with_capacity(n_pt_blocks);
     for blk in 0..n_pt_blocks {
-        let valid_bytes = if blk == n_pt_blocks - 1 { pt_last_bytes } else { 16 };
-        let ctr_block = make_nonce_ctr(nonce, (blk as u32) + 2);
-        let ks_n = notary_aes_block_wrk17(channel, ctr_block, k_n)?;
-        let ks_bits = crate::garble::semi_gb_split_bytes(&mut gb, channel, &ks_n)?;
-        let pt_bits = gb.receive_many(&mod2, channel)?;
-        let ct_bits = xor_blocks(&mut gb, &pt_bits, &ks_bits);
-
-        let ct_for_ghash: Vec<WireMod2> = if valid_bytes < 16 {
-            (0..128)
-                .map(|i| if i / 8 < valid_bytes { ct_bits[i].clone() } else { zero.clone() })
-                .collect()
+        let valid_bytes = if blk == n_pt_blocks - 1 {
+            pt_last_bytes
         } else {
-            ct_bits.clone()
+            16
         };
-        let xored = xor_blocks(&mut gb, &x_acc, &ct_for_ghash);
-        x_acc = ghash_mul(&mut gb, channel, &xored, &h_bits)?;
-        ct_blocks.push((ct_bits, valid_bytes));
+        let ctr_block = make_nonce_ctr(nonce, (blk as u32) + 2);
+        let ks_n = notary_aes_block_wrk17(channel, ctr_block, k_n, session)?;
+        channel.write(&ks_n)?;
+        ghash_blocks_n.push(zero_pad_block(ks_n, valid_bytes));
     }
 
     let mut len_block = [0u8; 16];
     len_block[0..8].copy_from_slice(&((aad.len() as u64) * 8).to_be_bytes());
     len_block[8..16].copy_from_slice(&((plaintext_len as u64) * 8).to_be_bytes());
-    let len_bits = gb.encode_many(&bytes_to_bits(&len_block), &mod2, channel)?;
-    let xored = xor_blocks(&mut gb, &x_acc, &len_bits);
-    let x_final = ghash_mul(&mut gb, channel, &xored, &h_bits)?;
+    ghash_blocks_n.push(len_block);
 
-    let tag_bits = xor_blocks(&mut gb, &x_final, &s_bits);
-
-    let mut all_outputs: Vec<WireMod2> = Vec::new();
-    for (ct_bits, valid_bytes) in &ct_blocks {
-        all_outputs.extend_from_slice(&ct_bits[..valid_bytes * 8]);
-    }
-    all_outputs.extend(tag_bits);
-    gb.outputs(&all_outputs, channel)?;
+    let x_acc_n = notary_ghash_chain_wrk17(channel, &ghash_blocks_n, h_n, session)?;
+    let tag_n = xor_bytes16(x_acc_n, s_n);
+    channel.write(&tag_n)?;
     Ok(())
 }
 
@@ -292,79 +236,60 @@ pub fn client_encrypt_gcm(
     plaintext: &[u8],
     aad: &[u8],
     _nonce: [u8; 12],
+    session: &mut Wrk17ClientSession,
 ) -> SwankyResult<(Vec<u8>, [u8; 16])> {
     let pt_len = plaintext.len();
     let n_aad_blocks = aad.len().div_ceil(16);
     let n_pt_blocks = pt_len.div_ceil(16);
-    let pt_last_bytes = if pt_len == 0 { 0 } else { ((pt_len - 1) % 16) + 1 };
+    let pt_last_bytes = if pt_len == 0 {
+        0
+    } else {
+        ((pt_len - 1) % 16) + 1
+    };
 
-    let rng = SwankyRng::new();
-    let mut ev = Evaluator::<SwankyRng, OtReceiver, WireMod2>::new(channel, rng)?;
-    let mod2 = vec![2u16; 128];
+    let h_c = client_aes_block_wrk17(channel, [0u8; 16], k_c, session)?;
+    let s_c = client_aes_block_wrk17(channel, [0u8; 16], k_c, session)?;
 
-    let h_c = client_aes_block_wrk17(channel, [0u8; 16], k_c)?;
-    let h_bits = crate::garble::semi_ev_split_bytes(&mut ev, channel, &h_c)?;
-
-    let s_c = client_aes_block_wrk17(channel, [0u8; 16], k_c)?;
-    let s_bits = crate::garble::semi_ev_split_bytes(&mut ev, channel, &s_c)?;
-
-    let zero = ev.constant(0, 2, channel)?;
-    let mut x_acc: Vec<WireMod2> = (0..128).map(|_| zero.clone()).collect();
+    let mut ghash_blocks_c = Vec::with_capacity(n_aad_blocks + n_pt_blocks + 1);
 
     for _ in 0..n_aad_blocks {
-        let aad_bits = ev.receive_many(&mod2, channel)?;
-        let xored = xor_blocks(&mut ev, &x_acc, &aad_bits);
-        x_acc = ghash_mul(&mut ev, channel, &xored, &h_bits)?;
+        ghash_blocks_c.push([0u8; 16]);
     }
 
-    let mut ct_blocks: Vec<(Vec<WireMod2>, usize)> = Vec::with_capacity(n_pt_blocks);
+    let mut ciphertext = Vec::with_capacity(pt_len);
     for blk in 0..n_pt_blocks {
-        let valid_bytes = if blk == n_pt_blocks - 1 { pt_last_bytes } else { 16 };
-        let ks_c = client_aes_block_wrk17(channel, [0u8; 16], k_c)?;
-        let ks_bits = crate::garble::semi_ev_split_bytes(&mut ev, channel, &ks_c)?;
+        let valid_bytes = if blk == n_pt_blocks - 1 {
+            pt_last_bytes
+        } else {
+            16
+        };
+        let ks_n: [u8; 16] = channel.read()?;
+        let ks_c = client_aes_block_wrk17(channel, [0u8; 16], k_c, session)?;
         let mut pt_block = [0u8; 16];
         let start = blk * 16;
         let end = ((blk + 1) * 16).min(pt_len);
         pt_block[..end - start].copy_from_slice(&plaintext[start..end]);
-        let pt_bits = ev.encode_many(&bytes_to_bits(&pt_block), &mod2, channel)?;
-        let ct_bits = xor_blocks(&mut ev, &pt_bits, &ks_bits);
-
-        let ct_for_ghash: Vec<WireMod2> = if valid_bytes < 16 {
-            (0..128)
-                .map(|i| if i / 8 < valid_bytes { ct_bits[i].clone() } else { zero.clone() })
-                .collect()
-        } else {
-            ct_bits.clone()
-        };
-        let xored = xor_blocks(&mut ev, &x_acc, &ct_for_ghash);
-        x_acc = ghash_mul(&mut ev, channel, &xored, &h_bits)?;
-        ct_blocks.push((ct_bits, valid_bytes));
+        let ct_c = xor_bytes16(pt_block, ks_c);
+        let ct = xor_bytes16(ct_c, ks_n);
+        ciphertext.extend_from_slice(&ct[..valid_bytes]);
+        ghash_blocks_c.push(zero_pad_block(ct_c, valid_bytes));
     }
 
-    let len_bits = ev.receive_many(&mod2, channel)?;
-    let xored = xor_blocks(&mut ev, &x_acc, &len_bits);
-    let x_final = ghash_mul(&mut ev, channel, &xored, &h_bits)?;
-    let tag_bits = xor_blocks(&mut ev, &x_final, &s_bits);
+    ghash_blocks_c.push([0u8; 16]);
 
-    let mut all_outputs: Vec<WireMod2> = Vec::new();
-    for (ct_bits, valid_bytes) in &ct_blocks {
-        all_outputs.extend_from_slice(&ct_bits[..valid_bytes * 8]);
-    }
-    all_outputs.extend(tag_bits);
+    let x_acc_c = client_ghash_chain_wrk17(channel, &ghash_blocks_c, h_c, session)?;
 
-    let vals = ev.outputs(&all_outputs, channel)?.expect("evaluator receives output");
-
-    let mut ciphertext = Vec::with_capacity(pt_len);
-    let mut cursor = 0;
-    for (_, valid_bytes) in &ct_blocks {
-        let chunk: Vec<u16> = vals[cursor..cursor + valid_bytes * 8].to_vec();
-        ciphertext.extend_from_slice(&bits_to_bytes_partial(chunk, *valid_bytes));
-        cursor += valid_bytes * 8;
-    }
-    let tag_vals: Vec<u16> = vals[cursor..].to_vec();
-    let tag = bits_to_bytes_16(tag_vals);
+    let tag_n: [u8; 16] = channel.read()?;
+    let tag = xor_bytes16(tag_n, xor_bytes16(x_acc_c, s_c));
 
     Ok((ciphertext, tag))
+}
+
+fn ev_len_block(aad_len: usize, pt_len: usize) -> [u8; 16] {
+    let mut len_block = [0u8; 16];
+    len_block[0..8].copy_from_slice(&((aad_len as u64) * 8).to_be_bytes());
+    len_block[8..16].copy_from_slice(&((pt_len as u64) * 8).to_be_bytes());
+    len_block
 }
 
 // ── split-key AES-GCM DECRYPT (notary / client) ───────────────────────────────
@@ -381,96 +306,50 @@ pub fn notary_decrypt_gcm(
     nonce: [u8; 12],
     aad_len: usize,
     ciphertext_len: usize,
+    session: &mut Wrk17NotarySession,
 ) -> SwankyResult<()> {
-    let rng = SwankyRng::new();
-    let mut gb = Garbler::<SwankyRng, OtSender, WireMod2>::new(channel, rng)?;
-    let mod2 = vec![2u16; 128];
-
     let n_aad_blocks = aad_len.div_ceil(16);
     let n_ct_blocks = ciphertext_len.div_ceil(16);
-    let ct_last_bytes = if ciphertext_len == 0 { 0 } else { ((ciphertext_len - 1) % 16) + 1 };
+    let ct_last_bytes = if ciphertext_len == 0 {
+        0
+    } else {
+        ((ciphertext_len - 1) % 16) + 1
+    };
 
-    let h_n = notary_aes_block_wrk17(channel, [0u8; 16], k_n)?;
-    let h_bits = crate::garble::semi_gb_split_bytes(&mut gb, channel, &h_n)?;
-
+    let h_n = notary_aes_block_wrk17(channel, [0u8; 16], k_n, session)?;
     let j0 = make_nonce_ctr(nonce, 1);
-    let s_n = notary_aes_block_wrk17(channel, j0, k_n)?;
-    let s_bits = crate::garble::semi_gb_split_bytes(&mut gb, channel, &s_n)?;
+    let s_n = notary_aes_block_wrk17(channel, j0, k_n, session)?;
 
-    let zero = gb.constant(0, 2, channel)?;
-    let mut x_acc: Vec<WireMod2> = (0..128).map(|_| zero.clone()).collect();
+    let mut ghash_blocks_n = Vec::with_capacity(n_aad_blocks + n_ct_blocks + 1);
 
-    // AAD blocks — client contributes the bytes; notary contributes zeros.
     for _ in 0..n_aad_blocks {
-        let aad_n_bits = gb.encode_many(&bytes_to_bits(&[0u8; 16]), &mod2, channel)?;
-        let aad_c_bits = gb.receive_many(&mod2, channel)?;
-        let aad_block = xor_blocks(&mut gb, &aad_n_bits, &aad_c_bits);
-        let xored = xor_blocks(&mut gb, &x_acc, &aad_block);
-        x_acc = ghash_mul(&mut gb, channel, &xored, &h_bits)?;
+        ghash_blocks_n.push([0u8; 16]);
     }
 
-    // Ciphertext blocks
-    let mut pt_blocks: Vec<(Vec<WireMod2>, usize)> = Vec::with_capacity(n_ct_blocks);
     for blk in 0..n_ct_blocks {
-        let valid_bytes = if blk == n_ct_blocks - 1 { ct_last_bytes } else { 16 };
-
-        let ctr_block = make_nonce_ctr(nonce, (blk as u32) + 2);
-        let ks_n = notary_aes_block_wrk17(channel, ctr_block, k_n)?;
-        let keystream = crate::garble::semi_gb_split_bytes(&mut gb, channel, &ks_n)?;
-
-        // Client contributes ciphertext bytes; notary contributes zeros.
-        let ct_n_bits = gb.encode_many(&bytes_to_bits(&[0u8; 16]), &mod2, channel)?;
-        let ct_c_bits = gb.receive_many(&mod2, channel)?;
-        let ct_bits = xor_blocks(&mut gb, &ct_n_bits, &ct_c_bits);
-
-        let pt_bits = xor_blocks(&mut gb, &ct_bits, &keystream);
-
-        // GHASH includes ciphertext, zero-padded beyond valid_bytes
-        let ct_for_ghash: Vec<WireMod2> = if valid_bytes < 16 {
-            (0..128)
-                .map(|i| {
-                    if i / 8 < valid_bytes {
-                        ct_bits[i].clone()
-                    } else {
-                        zero.clone()
-                    }
-                })
-                .collect()
+        let valid_bytes = if blk == n_ct_blocks - 1 {
+            ct_last_bytes
         } else {
-            ct_bits.clone()
+            16
         };
-        let xored = xor_blocks(&mut gb, &x_acc, &ct_for_ghash);
-        x_acc = ghash_mul(&mut gb, channel, &xored, &h_bits)?;
-
-        pt_blocks.push((pt_bits, valid_bytes));
+        let ctr_block = make_nonce_ctr(nonce, (blk as u32) + 2);
+        let ks_n = notary_aes_block_wrk17(channel, ctr_block, k_n, session)?;
+        let ct_c: [u8; 16] = channel.read()?;
+        ghash_blocks_n.push([0u8; 16]);
+        let pt_n = xor_bytes16(ct_c, ks_n);
+        channel.write(&pt_n)?;
+        let _ = valid_bytes;
     }
 
-    // GCM length block: aad_bits || ciphertext_bits, both u64 BE
-    let mut len_block = [0u8; 16];
-    len_block[0..8].copy_from_slice(&((aad_len as u64) * 8).to_be_bytes());
-    len_block[8..16].copy_from_slice(&((ciphertext_len as u64) * 8).to_be_bytes());
-    let len_bits = gb.encode_many(&bytes_to_bits(&len_block), &mod2, channel)?;
-    let xored = xor_blocks(&mut gb, &x_acc, &len_bits);
-    let x_final = ghash_mul(&mut gb, channel, &xored, &h_bits)?;
+    let len_block = ev_len_block(aad_len, ciphertext_len);
+    ghash_blocks_n.push(len_block);
 
-    // Expected tag = GHASH XOR S
-    let expected_tag_bits = xor_blocks(&mut gb, &x_final, &s_bits);
-
-    // Output plaintext + expected_tag to the evaluator; the evaluator compares
-    // expected_tag with the received tag in constant time outside the circuit.
-    let mut all_outputs: Vec<WireMod2> = Vec::new();
-    for (pt_bits, valid_bytes) in &pt_blocks {
-        all_outputs.extend_from_slice(&pt_bits[..valid_bytes * 8]);
-    }
-    all_outputs.extend(expected_tag_bits);
-    gb.outputs(&all_outputs, channel)?;
+    let x_acc_n = notary_ghash_chain_wrk17(channel, &ghash_blocks_n, h_n, session)?;
+    let tag_n = xor_bytes16(x_acc_n, s_n);
+    channel.write(&tag_n)?;
     Ok(())
 }
 
-/// Client side of split-key AES-128-GCM **decrypt**.
-///
-/// On success returns the plaintext. On tag mismatch returns
-/// `swanky_error::ErrorKind::OtherError` ("AES-GCM authentication failed").
 pub fn client_decrypt_gcm_2pc(
     channel: &mut Channel,
     k_c: [u8; 16],
@@ -478,106 +357,58 @@ pub fn client_decrypt_gcm_2pc(
     aad: &[u8],
     received_tag: [u8; 16],
     _nonce: [u8; 12],
+    session: &mut Wrk17ClientSession,
 ) -> SwankyResult<Vec<u8>> {
     let pt_len = ciphertext.len();
     let n_aad_blocks = aad.len().div_ceil(16);
     let n_ct_blocks = pt_len.div_ceil(16);
-    let pt_last_bytes = if pt_len == 0 { 0 } else { ((pt_len - 1) % 16) + 1 };
+    let pt_last_bytes = if pt_len == 0 {
+        0
+    } else {
+        ((pt_len - 1) % 16) + 1
+    };
 
-    let rng = SwankyRng::new();
-    let mut ev = Evaluator::<SwankyRng, OtReceiver, WireMod2>::new(channel, rng)?;
-    let mod2 = vec![2u16; 128];
+    let h_c = client_aes_block_wrk17(channel, [0u8; 16], k_c, session)?;
+    let s_c = client_aes_block_wrk17(channel, [0u8; 16], k_c, session)?;
 
-    let h_c = client_aes_block_wrk17(channel, [0u8; 16], k_c)?;
-    let h_bits = crate::garble::semi_ev_split_bytes(&mut ev, channel, &h_c)?;
+    let mut ghash_blocks_c = Vec::with_capacity(n_aad_blocks + n_ct_blocks + 1);
 
-    let s_c = client_aes_block_wrk17(channel, [0u8; 16], k_c)?;
-    let s_bits = crate::garble::semi_ev_split_bytes(&mut ev, channel, &s_c)?;
-
-    let zero = ev.constant(0, 2, channel)?;
-    let mut x_acc: Vec<WireMod2> = (0..128).map(|_| zero.clone()).collect();
-
-    // AAD blocks — client encodes aad bytes (zero-padded)
     for blk in 0..n_aad_blocks {
         let mut aad_block = [0u8; 16];
         let start = blk * 16;
         let end = ((blk + 1) * 16).min(aad.len());
         aad_block[..end - start].copy_from_slice(&aad[start..end]);
-        let aad_n_bits = ev.receive_many(&mod2, channel)?;
-        let aad_c_bits = ev.encode_many(&bytes_to_bits(&aad_block), &mod2, channel)?;
-        let aad_combined = xor_blocks(&mut ev, &aad_n_bits, &aad_c_bits);
-        let xored = xor_blocks(&mut ev, &x_acc, &aad_combined);
-        x_acc = ghash_mul(&mut ev, channel, &xored, &h_bits)?;
+        ghash_blocks_c.push(aad_block);
     }
 
-    let mut pt_blocks: Vec<(Vec<WireMod2>, usize)> = Vec::with_capacity(n_ct_blocks);
+    let mut plaintext = Vec::with_capacity(pt_len);
     for blk in 0..n_ct_blocks {
-        let valid_bytes = if blk == n_ct_blocks - 1 { pt_last_bytes } else { 16 };
-
-        let ks_c = client_aes_block_wrk17(channel, [0u8; 16], k_c)?;
-        let keystream = crate::garble::semi_ev_split_bytes(&mut ev, channel, &ks_c)?;
-
-        // Client encodes the ciphertext bytes (zero-padded if partial)
+        let valid_bytes = if blk == n_ct_blocks - 1 {
+            pt_last_bytes
+        } else {
+            16
+        };
         let mut ct_block = [0u8; 16];
         let start = blk * 16;
         let end = ((blk + 1) * 16).min(pt_len);
         ct_block[..end - start].copy_from_slice(&ciphertext[start..end]);
-        let ct_n_bits = ev.receive_many(&mod2, channel)?;
-        let ct_c_bits = ev.encode_many(&bytes_to_bits(&ct_block), &mod2, channel)?;
-        let ct_bits = xor_blocks(&mut ev, &ct_n_bits, &ct_c_bits);
-
-        let pt_bits = xor_blocks(&mut ev, &ct_bits, &keystream);
-
-        let ct_for_ghash: Vec<WireMod2> = if valid_bytes < 16 {
-            (0..128)
-                .map(|i| {
-                    if i / 8 < valid_bytes {
-                        ct_bits[i].clone()
-                    } else {
-                        zero.clone()
-                    }
-                })
-                .collect()
-        } else {
-            ct_bits.clone()
-        };
-        let xored = xor_blocks(&mut ev, &x_acc, &ct_for_ghash);
-        x_acc = ghash_mul(&mut ev, channel, &xored, &h_bits)?;
-
-        pt_blocks.push((pt_bits, valid_bytes));
+        channel.write(&ct_block)?;
+        let ks_c = client_aes_block_wrk17(channel, [0u8; 16], k_c, session)?;
+        ghash_blocks_c.push(zero_pad_block(ct_block, valid_bytes));
+        let pt_n: [u8; 16] = channel.read()?;
+        let pt_c = xor_bytes16(ct_block, ks_c);
+        let pt = xor_bytes16(pt_n, pt_c);
+        plaintext.extend_from_slice(&pt[..valid_bytes]);
     }
 
-    let len_bits = ev.receive_many(&mod2, channel)?;
-    let xored = xor_blocks(&mut ev, &x_acc, &len_bits);
-    let x_final = ghash_mul(&mut ev, channel, &xored, &h_bits)?;
-    let expected_tag_bits = xor_blocks(&mut ev, &x_final, &s_bits);
+    ghash_blocks_c.push([0u8; 16]);
 
-    let mut all_outputs: Vec<WireMod2> = Vec::new();
-    for (pt_bits, valid_bytes) in &pt_blocks {
-        all_outputs.extend_from_slice(&pt_bits[..valid_bytes * 8]);
-    }
-    all_outputs.extend(expected_tag_bits);
+    let x_acc_c = client_ghash_chain_wrk17(channel, &ghash_blocks_c, h_c, session)?;
 
-    let vals = ev
-        .outputs(&all_outputs, channel)?
-        .expect("evaluator receives output");
+    let tag_n: [u8; 16] = channel.read()?;
+    let expected_tag = xor_bytes16(tag_n, xor_bytes16(x_acc_c, s_c));
 
-    let mut plaintext = Vec::with_capacity(pt_len);
-    let mut cursor = 0;
-    for (_, valid_bytes) in &pt_blocks {
-        let chunk: Vec<u16> = vals[cursor..cursor + valid_bytes * 8].to_vec();
-        plaintext.extend_from_slice(&bits_to_bytes_partial(chunk, *valid_bytes));
-        cursor += valid_bytes * 8;
-    }
-    let tag_vals: Vec<u16> = vals[cursor..].to_vec();
-    let expected_tag = bits_to_bytes_16(tag_vals);
-
-    // Constant-time tag comparison
-    let mut diff = 0u8;
-    for i in 0..16 {
-        diff |= expected_tag[i] ^ received_tag[i];
-    }
-    if diff != 0 {
+    if !ct_eq16(expected_tag, received_tag) {
         swanky_error::bail!(
             swanky_error::ErrorKind::OtherError,
             "AES-GCM authentication failed"
@@ -595,14 +426,9 @@ pub struct NotaryCommit {
 }
 
 impl NotaryCommit {
-    pub fn new(
-        ciphertext: &[u8],
-        nonce: &[u8; 12],
-        session_id: &[u8],
-        signing_key: &[u8],
-    ) -> Self {
-        use sha2::{Digest, Sha256};
+    pub fn new(ciphertext: &[u8], nonce: &[u8; 12], session_id: &[u8], signing_key: &[u8]) -> Self {
         use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
 
         let mut hasher = Sha256::new();
         hasher.update(ciphertext);
@@ -614,7 +440,10 @@ impl NotaryCommit {
         mac.update(&ciphertext_hash);
         let signature = mac.finalize().into_bytes().to_vec();
 
-        NotaryCommit { ciphertext_hash, signature }
+        NotaryCommit {
+            ciphertext_hash,
+            signature,
+        }
     }
 
     pub fn verify(
@@ -635,7 +464,10 @@ pub fn client_decrypt(
     ciphertext: &[u8],
     nonce: &[u8; 12],
 ) -> Result<Vec<u8>, aes_gcm::Error> {
-    use aes_gcm::{aead::{Aead, KeyInit}, Aes128Gcm, Key, Nonce};
+    use aes_gcm::{
+        Aes128Gcm, Key, Nonce,
+        aead::{Aead, KeyInit},
+    };
     let k: [u8; 16] = std::array::from_fn(|i| k_c[i] ^ k_n_revealed[i]);
     let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&k));
     cipher.decrypt(Nonce::from_slice(nonce), ciphertext)
@@ -644,7 +476,10 @@ pub fn client_decrypt(
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 pub(crate) fn bytes_to_bits(bytes: &[u8]) -> Vec<u16> {
-    bytes.iter().flat_map(|&b| (0..8u8).rev().map(move |i| ((b >> i) & 1) as u16)).collect()
+    bytes
+        .iter()
+        .flat_map(|&b| (0..8u8).rev().map(move |i| ((b >> i) & 1) as u16))
+        .collect()
 }
 
 pub(crate) fn bits_to_bytes_16(bits: Vec<u16>) -> [u8; 16] {
@@ -664,25 +499,16 @@ pub(crate) fn make_nonce_ctr(nonce: [u8; 12], counter: u32) -> [u8; 16] {
     nonce_ctr
 }
 
-/// Decode a variable-length bit vector (MSB-first per byte) into `n_bytes` bytes.
-/// Used for the partial last ciphertext block in `client_encrypt_gcm`.
-pub(crate) fn bits_to_bytes_partial(bits: Vec<u16>, n_bytes: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n_bytes];
-    for (i, chunk) in bits.chunks(8).enumerate().take(n_bytes) {
-        for (j, &bit) in chunk.iter().enumerate() {
-            out[i] |= (bit as u8) << (7 - j);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::garble::{Wrk17ClientSession, Wrk17NotarySession};
     use swanky_channel::local::local_channel_pair;
 
     /// Round-trip: 2PC encrypt → 2PC decrypt with same split key recovers plaintext.
+    /// Slow: several WRK17 AES-128 blocks per direction (~minutes in debug).
     #[test]
+    #[ignore = "WRK17 per-block AES; run with `cargo test --release decrypt_2pc -- --ignored`"]
     fn decrypt_2pc_round_trip() {
         let k_n = [0x2bu8; 16];
         let k_c = [0x60u8; 16];
@@ -692,15 +518,26 @@ mod tests {
 
         // First encrypt via 2PC
         let ((), (ct, tag)) = local_channel_pair(
-            |ch| notary_encrypt_gcm(ch, k_n, nonce, aad, plaintext.len()),
-            |ch| client_encrypt_gcm(ch, k_c, plaintext, aad, nonce),
+            |ch| {
+                let mut session = Wrk17NotarySession::init(ch)?;
+                notary_encrypt_gcm(ch, k_n, nonce, aad, plaintext.len(), &mut session)
+            },
+            |ch| {
+                let mut session = Wrk17ClientSession::init(ch)?;
+                client_encrypt_gcm(ch, k_c, plaintext, aad, nonce, &mut session)
+            },
         )
         .unwrap();
 
-        // Decrypt via 2PC — should return the original plaintext
         let ((), recovered) = local_channel_pair(
-            |ch| notary_decrypt_gcm(ch, k_n, nonce, aad.len(), ct.len()),
-            |ch| client_decrypt_gcm_2pc(ch, k_c, &ct, aad, tag, nonce),
+            |ch| {
+                let mut session = Wrk17NotarySession::init(ch)?;
+                notary_decrypt_gcm(ch, k_n, nonce, aad.len(), ct.len(), &mut session)
+            },
+            |ch| {
+                let mut session = Wrk17ClientSession::init(ch)?;
+                client_decrypt_gcm_2pc(ch, k_c, &ct, aad, tag, nonce, &mut session)
+            },
         )
         .unwrap();
         assert_eq!(recovered, plaintext);
@@ -709,6 +546,7 @@ mod tests {
     /// 2PC decrypt rejects a forged ciphertext (tag verification fires inside the
     /// client side after the circuit returns the expected tag).
     #[test]
+    #[ignore = "WRK17 per-block AES; run with `cargo test --release decrypt_2pc -- --ignored`"]
     fn decrypt_2pc_rejects_tampered_ciphertext() {
         let k_n = [0x11u8; 16];
         let k_c = [0x22u8; 16];
@@ -716,17 +554,28 @@ mod tests {
         let plaintext = b"some plaintext data";
 
         let ((), (mut ct, tag)) = local_channel_pair(
-            |ch| notary_encrypt_gcm(ch, k_n, nonce, b"", plaintext.len()),
-            |ch| client_encrypt_gcm(ch, k_c, plaintext, b"", nonce),
+            |ch| {
+                let mut session = Wrk17NotarySession::init(ch)?;
+                notary_encrypt_gcm(ch, k_n, nonce, b"", plaintext.len(), &mut session)
+            },
+            |ch| {
+                let mut session = Wrk17ClientSession::init(ch)?;
+                client_encrypt_gcm(ch, k_c, plaintext, b"", nonce, &mut session)
+            },
         )
         .unwrap();
 
-        // Flip one byte of the ciphertext
         ct[0] ^= 0x80;
 
         let result = local_channel_pair(
-            |ch| notary_decrypt_gcm(ch, k_n, nonce, 0, ct.len()),
-            |ch| client_decrypt_gcm_2pc(ch, k_c, &ct, b"", tag, nonce),
+            |ch| {
+                let mut session = Wrk17NotarySession::init(ch)?;
+                notary_decrypt_gcm(ch, k_n, nonce, 0, ct.len(), &mut session)
+            },
+            |ch| {
+                let mut session = Wrk17ClientSession::init(ch)?;
+                client_decrypt_gcm_2pc(ch, k_c, &ct, b"", tag, nonce, &mut session)
+            },
         );
         // Local channel pair returns an error if either side errored
         assert!(result.is_err(), "tampered ciphertext must fail tag check");
@@ -734,10 +583,11 @@ mod tests {
 
     /// 2PC decrypt output matches `aes-gcm` crate decrypt with `K = K_N XOR K_C`.
     #[test]
+    #[ignore = "WRK17 per-block AES; run with `cargo test --release decrypt_2pc -- --ignored`"]
     fn decrypt_2pc_matches_aes_gcm_crate() {
         use aes_gcm::{
-            aead::{Aead, KeyInit, Payload},
             Aes128Gcm, Key, Nonce,
+            aead::{Aead, KeyInit, Payload},
         };
         let k_n = [0x2bu8; 16];
         let k_c = [0x60u8; 16];
@@ -749,15 +599,27 @@ mod tests {
         // Reference encrypt with the aes-gcm crate
         let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&k));
         let reference = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .unwrap();
         let ct = &reference[..plaintext.len()];
         let tag: [u8; 16] = reference[plaintext.len()..].try_into().unwrap();
 
         // Decrypt via 2PC
         let ((), recovered) = local_channel_pair(
-            |ch| notary_decrypt_gcm(ch, k_n, nonce, aad.len(), ct.len()),
-            |ch| client_decrypt_gcm_2pc(ch, k_c, ct, aad, tag, nonce),
+            |ch| {
+                let mut session = Wrk17NotarySession::init(ch)?;
+                notary_decrypt_gcm(ch, k_n, nonce, aad.len(), ct.len(), &mut session)
+            },
+            |ch| {
+                let mut session = Wrk17ClientSession::init(ch)?;
+                client_decrypt_gcm_2pc(ch, k_c, ct, aad, tag, nonce, &mut session)
+            },
         )
         .unwrap();
 

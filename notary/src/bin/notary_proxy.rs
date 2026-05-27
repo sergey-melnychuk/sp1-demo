@@ -30,18 +30,20 @@ use std::thread;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
-use notary::ecdh::{self, share_to_bytes, EcdhSetupOutcome};
+use notary::ecdh::{self, EcdhSetupOutcome, share_to_bytes};
 use notary::garble::production_session_binding;
 use notary::handshake::{read_handshake_capture, verify_handshake_capture};
 use notary::tls::{
-    notary_ecdh_after_setup_ivs, run_notary_worker_attested, run_notary_worker_attested_2pc,
-    TwoPcTrafficSetup,
+    TwoPcTrafficSetup, notary_ecdh_after_setup_ivs, run_notary_worker_attested,
+    run_notary_worker_attested_2pc,
 };
 use rand::RngCore;
 use swanky_channel::Channel;
 
 #[derive(Parser, Debug)]
-#[command(about = "2PC notary daemon — runs garbler-side AES-GCM for split-key TLS sessions, signs session bundles")]
+#[command(
+    about = "2PC notary daemon — runs garbler-side AES-GCM for split-key TLS sessions, signs session bundles"
+)]
 struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:9001")]
@@ -65,9 +67,11 @@ fn load_or_create_key(path: &PathBuf) -> Result<SigningKey> {
         let mut seed = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut seed);
         let sk = SigningKey::from_bytes(&seed);
-        fs::write(path, sk.to_bytes())
-            .with_context(|| format!("write {}", path.display()))?;
-        eprintln!("notary_proxy: generated new signing key at {}", path.display());
+        fs::write(path, sk.to_bytes()).with_context(|| format!("write {}", path.display()))?;
+        eprintln!(
+            "notary_proxy: generated new signing key at {}",
+            path.display()
+        );
         Ok(sk)
     }
 }
@@ -79,7 +83,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     s
 }
-
 
 /// Setup mode byte from prover (`notary_demo`).
 const SETUP_LEGACY_HOST_MASKS: u8 = 0;
@@ -98,7 +101,7 @@ enum SetupKeys {
         after_sh: [u8; 32],
         after_sf: [u8; 32],
         ikm_full: [u8; 32],
-        binding: sp1_demo_common::SessionBinding,
+        binding: Box<sp1_demo_common::SessionBinding>,
     },
 }
 
@@ -117,9 +120,7 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
             iv_tx.copy_from_slice(&frame[16..28]);
             k_n_rx.copy_from_slice(&frame[28..44]);
             iv_rx.copy_from_slice(&frame[44..56]);
-            eprintln!(
-                "notary_proxy: setup LEGACY host-chosen XOR masks received from {peer}"
-            );
+            eprintln!("notary_proxy: setup LEGACY host-chosen XOR masks received from {peer}");
             Ok(SetupKeys::PreSplit {
                 k_n_tx,
                 iv_tx,
@@ -144,9 +145,7 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
                     "flush setup after notary-chosen masks: {e}"
                 )
             })?;
-            eprintln!(
-                "notary_proxy: pushed XOR masks + scalar share ({peer}), waiting for IVs"
-            );
+            eprintln!("notary_proxy: pushed XOR masks + scalar share ({peer}), waiting for IVs");
             let mut iv_tx = [0u8; 12];
             let mut iv_rx = [0u8; 12];
             ch.read_bytes(&mut iv_tx)?;
@@ -188,29 +187,30 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
                 cap.outbound.len(),
                 cap.inbound.len()
             );
-            let (ikm_n, ikm_full) = match notary_ecdh_after_setup_ivs(ch, &ecdh_share, &mut rand::thread_rng())? {
-                EcdhSetupOutcome::Skipped => {
-                    eprintln!("notary_proxy: ECDH skipped — cannot derive 2PC traffic keys");
-                    swanky_error::bail!(
-                        swanky_error::ErrorKind::OtherError,
-                        "2PC traffic setup requires ECDH from {peer}"
-                    );
-                }
-                EcdhSetupOutcome::Leaky(outcome) => {
-                    eprintln!(
-                        "notary_proxy: leaky ECDH IKM={}",
-                        hex_encode(&outcome.ikm.0)
-                    );
-                    (outcome.notary_ikm_share, outcome.ikm.0)
-                }
-                EcdhSetupOutcome::Ot(outcome) => {
-                    eprintln!(
-                        "notary_proxy: OT ECDH IKM={} (host XOR share only)",
-                        hex_encode(&outcome.ikm.0)
-                    );
-                    (outcome.notary_ikm_share, outcome.ikm.0)
-                }
-            };
+            let (ikm_n, ikm_full) =
+                match notary_ecdh_after_setup_ivs(ch, &ecdh_share, &mut rand::thread_rng())? {
+                    EcdhSetupOutcome::Skipped => {
+                        eprintln!("notary_proxy: ECDH skipped — cannot derive 2PC traffic keys");
+                        swanky_error::bail!(
+                            swanky_error::ErrorKind::OtherError,
+                            "2PC traffic setup requires ECDH from {peer}"
+                        );
+                    }
+                    EcdhSetupOutcome::Leaky(outcome) => {
+                        eprintln!(
+                            "notary_proxy: leaky ECDH IKM={}",
+                            hex_encode(&outcome.ikm.0)
+                        );
+                        (outcome.notary_ikm_share, outcome.ikm.0)
+                    }
+                    EcdhSetupOutcome::Ot(outcome) => {
+                        eprintln!(
+                            "notary_proxy: OT ECDH IKM={} (host XOR share only)",
+                            hex_encode(&outcome.ikm.0)
+                        );
+                        (outcome.notary_ikm_share, outcome.ikm.0)
+                    }
+                };
             ch.force_flush().map_err(|e| {
                 swanky_error::swanky_error!(
                     swanky_error::ErrorKind::NetworkError,
@@ -227,7 +227,7 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
                 after_sh: verified.after_sh,
                 after_sf: verified.after_sf,
                 ikm_full,
-                binding: verified.binding,
+                binding: Box::new(verified.binding),
             })
         }
         other => swanky_error::bail!(
@@ -239,8 +239,10 @@ fn read_setup_frame(ch: &mut Channel, peer: &str) -> swanky_error::Result<SetupK
 }
 
 fn handle(stream: TcpStream, signing_key: Arc<SigningKey>) -> swanky_error::Result<()> {
-    let peer =
-        stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<?>".into());
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<?>".into());
     eprintln!("notary_proxy: connection from {peer}");
     Channel::with(stream, |ch| {
         match read_setup_frame(ch, &peer)? {
@@ -285,7 +287,7 @@ fn handle(stream: TcpStream, signing_key: Arc<SigningKey>) -> swanky_error::Resu
                         after_sh,
                         after_sf,
                         ikm_full,
-                        binding,
+                        binding: *binding,
                     },
                 )? {
                     Some(bundle) => eprintln!(

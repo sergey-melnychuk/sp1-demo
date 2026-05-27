@@ -1,6 +1,77 @@
 # TODO — toward production-grade zkTLS
 
-## Status (what's built in `notary/`)
+Engineering backlog for the full repo (SP1 + notary). Production phases and acceptance
+criteria: **[`PROD.md`](PROD.md)** (especially §2.1 replaceable notary). Architecture:
+**[`INFO.md`](INFO.md)**.
+
+---
+
+## Recommended path forward
+
+**Bet on the witness → SP1 layer, not custom MPC.** The durable product is
+`common/` + guest notary path + `host/notarized`. The `notary/` crate (WRK17, swanky,
+mode 0–2) is a **reference backend** that already produces valid witnesses — treat it as
+frozen unless you need a local demo without tlsn.
+
+```
+  [Notary backend]          [This repo — core]
+  tlsn / trusted witness    common/ witness schema
+        or                      ↓
+  notary_demo (ref)  ──►  TlsWitness.bin  ──►  host/notarized  ──►  SP1 guest  ──►  proof
+```
+
+### Phase A — Ship the contract (weeks)
+
+Focus: make the witness schema the public API and prove one E2E path works without touching
+garbled circuits.
+
+- [ ] **`SessionBinding` v2** — new `bundle_version`; keep TLS fields (`server_epk`,
+  `cert_chain_hash`, `handshake_transcript_hash`, `key_schedule_context_hash`); drop or
+  optionalize `circuit_*` + `garbling_mode`. Guest + `notary_verify` accept v1 and v2.
+- [ ] **Proof statement doc** — one page: public outputs, witness layout, what is / isn't
+  proved in notary vs self-prove modes (verifier-facing).
+- [ ] **Fixture + CI** — checked-in `TlsWitness` bin + SP1 mock prove in CI; fast default
+  tests stay under ~2 min.
+- [ ] **Guest binding hardening** — assert `cert_chain_hash` and `key_schedule_context_hash`
+  against witness bytes where feasible today (epk + transcript already checked).
+- [ ] **Document E2E** — single flow in README: witness export → `notarized --prove`
+  (reference: `notary_demo --witness-out` mode 2).
+
+### Phase B — Replace reference MPC (months)
+
+Focus: stop maintaining WRK17 as a dependency; plug in a real notary ecosystem.
+
+- [ ] **tlsn adapter (preferred)** — map tlsn attestation → `NotaryAttestation` /
+  `NotaryBundle` + host key shares; same SP1 guest unchanged.
+- [ ] **Or: minimal trusted notary** — thin service: observe TLS, sign commits + binding v2,
+  no garbling (faster path to model A in [`PROD.md`](PROD.md)).
+- [ ] **Notary transport** — mTLS or pinned pubkey to notary daemon (applies to any backend).
+- [ ] **Replay policy** — session id, timestamp, verifier rejects stale bundles.
+
+### Phase C — Stronger proofs (optional, when needed)
+
+- [ ] **In-guest TLS verify on notary path** — cert chain + `CertificateVerify` inside zkVM
+  using bound transcript (expensive; reduces trust in notary signature alone).
+- [ ] **Selective disclosure** — Merkle commits + prove predicate without full body leak.
+- [ ] **Self-prove path polish** — keep as Succinct demo / user-runs-prover use case.
+
+### Explicitly deprioritized (unless you want model B)
+
+Do **not** block shipping on these — they live in reference `notary/` or long-horizon
+[`PROD.md`](PROD.md) §4.1:
+
+- WRK17 performance (unrolled HMAC, batched AES, pipelined worker)
+- OT-MtA X25519 / incremental 2PC schedule / “neither party knows K”
+- GCM tag inside garbled circuit
+- swanky vendoring upgrades
+
+**Exit criteria for “promising product slice”:** third party verifies SP1 proof + notary
+signature + witness binding without trusting host-chosen digests; notary backend is
+pluggable (tlsn or trusted witness); reference `notary/` optional for demos only.
+
+---
+
+## Status (reference notary — `notary/`)
 
 **Production-ish witness path** for mode 2 — not full malicious-security MPC. See
 [Trust model gaps](#trust-model-gaps-why-this-is-not-prod-ready) below.
@@ -18,25 +89,34 @@ cert hash + epk); notary runs `verify_handshake_capture` after ECDH; then 2PC HK
 and AES records. Signed **NotaryBundle v1** includes [`SessionBinding`](common/src/lib.rs).
 Verify with `notary_verify` or SP1 guest (transcript hash + epk checks).
 
-Docs: [`DEMO.md`](DEMO.md), ECDH wire: [`ECDH.md`](ECDH.md).
+Docs: [`DEMO.md`](DEMO.md), [`INFO.md`](INFO.md), [`PROD.md`](PROD.md), ECDH: [`ECDH.md`](ECDH.md).
 
 ### Working primitives
 
 - **`handshake.rs`** — mode-2 capture wire; notary-side transcript + cert verify.
-- **`aes.rs`** — split-key 2PC AES-GCM (semi-honest); byte-identical to `aes-gcm`.
-- **`hkdf.rs`** — 2PC HMAC/HKDF via **one garbler session per SHA-256 compress**
-  (chains XOR output shares between HMAC rounds); full TLS 1.3 client traffic schedule.
+- **`aes.rs`** — split-key 2PC AES-GCM; byte-identical to `aes-gcm`; unrolled WRK17
+  GHASH chain per record direction; `Wrk17*Session` OT reuse on the channel.
+- **`ghash.rs`** — GF(2^128) multiply chain in one WRK17 `execute` per direction.
+- **`hkdf.rs`** — 2PC HMAC/HKDF (WRK17 compress); chains XOR shares between HMAC
+  rounds; full TLS 1.3 client traffic schedule; reuses `Wrk17*Session`.
 - **`ecdh.rs`** — OT-blinded ECDH (default); TLS-correct IKM via `reference_ikm`.
 - **`transcript.rs`** — handshake hash parsing (host + notary).
 - **`tls.rs`** — record bridge, attested worker, `OP_2PC_HKDF`.
 - **`common::NotaryBundle`** — v0 legacy + **v1 `SessionBinding`** in signature.
 - **`notary_verify`** — standalone bundle + optional witness cross-check.
-- **`garble.rs`** — WRK17 helpers + `SplitSharedInputMaskCircuit`; HKDF + per-block AES wired.
+- **`garble.rs`** — WRK17 helpers + `Wrk17NotarySession` / `Wrk17ClientSession`
+  (KOS OT extension once per channel; shared Δ per session).
 
 ### Tests
 
-`cargo test --lib --release` — **28 passed** (~12 s). Includes WRK17 compress
-round-trip, TCP/local ECDH→HKDF integration, signed bundle v1.
+Default `cargo test --release -p notary --lib` runs the **fast** suite (~18 s):
+**18 passed**, **14 ignored** — GHASH/HKDF unit round-trips, ECDH wire tests, commit flow.
+
+**Ignored** (WRK17 integration — run with `--ignored` when needed):
+
+- `decrypt_2pc_*` — full AES-GCM 2PC records
+- `hkdf_over_*`, `tls13_traffic_2pc_*` — full TLS 1.3 traffic HKDF schedule (~80 WRK17 compress sessions)
+- `split_key_record`, `rustls_bridge`, `notary_bundle` — record worker round-trips
 
 ---
 
@@ -48,37 +128,25 @@ Three structural issues block third-party or malicious-security claims:
 |-----|--------|----------------|
 | **Host-side handshake parser** | **Fixed (mode 2):** host sends raw bytes; notary verifies in `handshake.rs`. Host still uses local `reference_ikm` for optional rustls cross-check only. | Malicious host cannot lie about transcript for mode 2 HKDF binding. |
 | **Trusted-notary semantics** | Bundle v1 signs `SessionBinding` (cert hash, transcript root, epk, circuit IDs). `notary_verify` + guest checks. Notary still learns full IKM. | Verifier can check signature + witness fields; not full MPC secrecy. |
-| **Semi-honest garbling** | HKDF + AES blocks use **WRK17**; GHASH (AND gates) stays semi-honest in one session per encrypt/decrypt. | Malicious garbler can still cheat on GHASH until that moves to WRK17. |
+| **Authenticated garbling** | HKDF, AES blocks, and GHASH use **WRK17**; KOS OT reused per channel (`Wrk17*Session`). GCM tag check still outside circuit. | WRK17 auth mode; not a full malicious-MPC proof; tag failure leaks one bit today. |
 
 ### Rationale
 
-These gaps compose: even with mode 2 (no host extract for **record** keys), the host still
-**asserts** the handshake context the HKDF binds to. The notary **computes** 2PC AES/HKDF honestly
-but cannot **verify** the binding without raw handshake bytes or incremental 2PC schedule. Semi-honest
-garbling means a malicious notary (or corrupted notary process) could deviate from the published
-circuits without detection.
+These gaps compose: even with mode 2 (no host extract for **record** keys), the notary still
+learns full IKM on the OT path. WRK17 covers record-layer circuits, but **tag verify** and
+**delegated proving** remain open — see [`PROD.md`](PROD.md).
 
-**Two product paths** (not mutually exclusive long-term):
+**Two product paths** (see [`PROD.md`](PROD.md) §1):
 
-1. **TLSNotary-style witness (faster)** — Notary is an independent witness: signs commits to
-   **observed** wire bytes + record ciphertext hashes + server identity. Verifier checks signature
-   + recomputes commits. Notary may learn IKM; trust shifts to signature + transparency, not MPC secrecy.
+1. **Witness notary (recommended)** — independent notary signs commits + binding; SP1 proves
+   the JSON claim. MPC stack is **replaceable** (§2.1). Ship Phase A + B above.
+2. **True 2PC notary (long horizon)** — neither party knows K; OT-MtA, malicious MPC. Only if
+   you commit to tlsn-class engineering — not the default path for this repo.
 
-2. **True 2PC notary (harder)** — Neither party holds full IKM or traffic keys; OT-MtA X25519;
-   incremental 2PC key schedule; authenticated garbling. Required for “host never knew K” and
-   “notary never knew K” simultaneously.
+### Recommended fix order (historical — reference notary)
 
-### Recommended fix order
-
-```
-Raw handshake → notary     (remove host digest trust)
-       ↓
-Richer signed bundle       (cert chain, transcript root, circuit IDs)
-       ↓
-Authenticated garbling   (remove “trust notary MPC”)
-       ↓
-OT-MtA ECDH + incremental 2PC schedule   (remove host scalar leak + notary full IKM)
-```
+Mode 2 + WRK17 record layer + bundle v1 are **done for the reference demo**. Further MPC
+work is optional; prefer Phase A/B in [Recommended path forward](#recommended-path-forward).
 
 #### 1. Host-side handshake parser → notary-side verification — **done (mode 2)**
 
@@ -94,14 +162,21 @@ OT-MtA ECDH + incremental 2PC schedule   (remove host scalar leak + notary full 
 
 **2PC path (B):** OT-MtA, drop `ikm_full`, incremental schedule — unchanged.
 
-#### 3. Semi-honest garbling — **HKDF + AES blocks done; GHASH semi-honest**
+#### 3. WRK17 record layer — **done (demo bar)**
 
-- **Done:** per-compress HMAC sessions (WRK17); per-block AES (WRK17) with semi-honest GHASH.
-- **Next:** WRK17 GHASH (optional; AND-heavy, one session per record today).
+- **Done:** per-compress HMAC (WRK17); per-block AES (WRK17); unrolled GHASH chain (WRK17);
+  `Wrk17NotarySession` / `Wrk17ClientSession` (KOS OT once per channel).
+- **Next:** GCM tag inside circuit; unrolled HMAC (4 compresses → 1 session); batched AES blocks.
 
-**Minimum “production-ish” bar:** items 1 + witness 2 **done**; item 3 **HKDF + AES blocks done**.
+**Minimum “production-ish” demo bar:** items 1 + witness 2 + WRK17 record layer **done**.
+Production gaps: [`PROD.md`](PROD.md).
 
 ---
+
+## Reference-notary backlog (model B / `notary/` only)
+
+Detailed gaps below apply to the **in-repo MPC demo** or long-horizon true 2PC. They are
+**not** on the default shipping path — see [Recommended path forward](#recommended-path-forward).
 
 ## Cryptographic gaps (the protocol)
 
@@ -117,11 +192,12 @@ shares (~1500–2000 LOC; no swanky primitive — see `mpz`). Until then:
 - Mode 1: host briefly holds full AES keys between extract and `zeroize()`.
 - Mode 2: host never extracts record keys, but still knows full IKM locally for transcript parsing.
 
-### 2. Authenticated garbling *(HKDF + AES blocks done; GHASH semi-honest)*
+### 2. Authenticated garbling — **WRK17 on HKDF + AES + GHASH (demo)**
 
-`swanky-authenticated-garbling` (WRK17) for HKDF compress and each AES-128 block in
-GCM. `SplitSharedInputMaskCircuit` + `wrk17_*_masked_run` in `garble.rs`. GHASH
-(128×128 AND mul) remains on one semi-honest garbler/evaluator pair per encrypt/decrypt.
+`swanky-authenticated-garbling` (WRK17) via `SplitSharedInputMaskCircuit` in `garble.rs`.
+Vendored patch: `new_with_and_generator`, shared `AndTripleGenerator` per channel.
+
+**Still open:** GCM tag equality in-circuit; unrolled HMAC; batched AES; formal MPC review.
 
 ### 3. Signed attestation *(witness path — done for v1)*
 
@@ -161,10 +237,13 @@ Raw handshake capture + notary verify + `SessionBinding` in signed bundle.
 
 ## Performance
 
-### 9. OT bootstrap per record / HKDF round
+### 9. OT bootstrap — **partially done**
 
-Each `Garbler::new` re-runs OT init (~10–100 ms). Amortize with OT extension (`swanky-ot-alsz-kos`)
-+ one authenticated preprocessing per session. Critical for mode 2 (many HKDF rounds before AES).
+**Done:** `Wrk17*Session` reuses KOS OT extension for the whole host↔notary channel (no full
+re-bootstrap per `Garbler::new`).
+
+**Still open:** each SHA compress / AES block still runs full WRK17 **preprocess + execute**
+(~80 compress sessions for full mode-2 HKDF). Unroll HMAC + batch AES — see [`PROD.md`](PROD.md) §4.1 P3.
 
 ### 10. ~100k AND gates per record
 
@@ -199,16 +278,19 @@ Not started.
 
 ## Priority order for shipping
 
-If treating this as a roadmap toward a real product:
+**Default roadmap:** [Recommended path forward](#recommended-path-forward) (witness contract →
+external notary → optional guest hardening). Full phased plan: **[`PROD.md`](PROD.md)**.
 
-1. **WRK17 GHASH** (optional) or OT-MtA ECDH (#1 completion).
-2. **OT-MtA ECDH + incremental 2PC schedule** — true split IKM (#1 completion).
-3. **Selective disclosure** — privacy upside (#5).
-4. Performance (#9–#10) + operational (#11–#15).
+| Priority | Work | Where |
+|----------|------|--------|
+| **P0** | `SessionBinding` v2, proof statement, witness fixture + CI mock prove | `common/`, `guest/`, `host/` |
+| **P1** | tlsn adapter *or* minimal trusted notary; mTLS / pinning | new adapter crate or service |
+| **P2** | Guest cert/`CertificateVerify` (optional); selective disclosure | `guest/` |
+| **P3** | Self-prove demo polish | `host/main`, `guest/` |
+| **Frozen** | WRK17 perf, OT-MtA, tag-in-circuit | `notary/` — reference only |
 
-Items 1–4 are each non-trivial. Public [`tlsnotary/tlsn`](https://github.com/tlsnotary/tlsn) +
-[`mpz`](https://github.com/privacy-scaling-explorations/mpz) represent years of work on overlapping problems.
+**Current demo is suitable for:** witness → SP1 experiments, protocol debugging, internal PoC
+with reference `notary_demo` mode 2.
 
-**Current demo is suitable for:** internal PoC, protocol debugging, circuit/integration tests, SP1 pipeline experiments.
-
-**Not suitable for:** production notary service, untrusted third-party verification, or malicious-host/security claims without items 1–3.
+**Not suitable for:** production notary service or malicious-host claims without Phase B+
+(notary transport, replay policy, and ideally tlsn or audited trusted witness).

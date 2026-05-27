@@ -6,22 +6,26 @@
 
 **Normative crypto:** RFC 7748 (X25519), RFC 8446 §7.1 (where the 32-byte output is consumed — read for alignment only; **do not** implement HKDF in this track unless you intentionally expand scope).
 
-## Status (2026-05-26)
+## Status (May 2026)
 
 | Phase | State |
 |-------|--------|
-| A — curve math + tests | ✅ `ecdh.rs`: additive shares, XOR split, 4 unit tests |
+| A — curve math + tests | ✅ `ecdh.rs`: additive shares, XOR split, unit + pipe tests |
 | B — protocol note | ✅ **§ Protocol** below |
 | C — wire + sanity binary | ✅ leaky + OT-blinded, `ecdh_2pc_sanity --self-test [--ot]` |
 | C+ — ServerHello parser | ✅ `parse_server_hello_key_share` |
-| D — TLS / `notary_demo` integration | ✅ mode 1: pre-TLS scalar share + post-IV ECDH on notary TCP |
-| Real OT 2PC (`OtX25519Blinded`) | ✅ blinded point-add wire (host XOR IKM share); MtA scalar mult ⬜ |
+| D — TLS / `notary_demo` integration | ✅ modes 1–2: scalar share + post-handshake ECDH on notary channel |
+| E — mode 2 HandshakeCapture | ✅ raw bytes before ECDH; notary verifies in `handshake.rs` |
+| Real OT 2PC (`OtX25519Blinded`) | ✅ blinded point-add wire (host XOR IKM share); **MtA scalar mult ⬜** |
 
 ---
 
 ## Protocol
 
-Wire formats for `notary_demo` ↔ `notary_proxy` (mode **1**). Code: [`notary/src/ecdh.rs`](notary/src/ecdh.rs).
+Wire formats for `notary_demo` ↔ `notary_proxy` (modes **1** and **2**). Code: [`notary/src/ecdh.rs`](notary/src/ecdh.rs).
+
+**Mode 2:** same OT ECDH framing after [`HandshakeCapture`](notary/src/handshake.rs) is sent;
+see [`DEMO.md`](DEMO.md). Setup byte `2` sends notary scalar only (no XOR mask halves).
 
 **Security:** Semi-honest demo. **OT-blinded** (default) does not send cleartext partial points; the host receives only an XOR share of IKM. The notary (trusted) reconstructs full IKM locally. **Leaky** mode still sends `P_c`/`P_n` in the clear. Full OT-MtA scalar mult ([`TODO.md`](TODO.md) #1) is not implemented.
 
@@ -74,7 +78,8 @@ Both parties compute full IKM locally. Debug / plumbing only.
 
 ```bash
 cd notary
-cargo test --lib ecdh
+cargo test --release -p notary --lib ecdh
+cargo clippy --all-targets -- -D warnings
 cargo run --release --bin ecdh_2pc_sanity -- --self-test
 cargo run --release --bin ecdh_2pc_sanity -- --self-test --ot
 ```
@@ -104,7 +109,7 @@ OT/MtA scalar multiplication so neither party reconstructs IKM; feed XOR shares 
 
 **Out of scope for this document**
 
-- Proving anything in zkVM, Ed25519 bundles, split AES-GCM (already in [`notary/src/aes.rs`](notary/src/aes.rs)), or wiring into [`notary/src/bin/notary_demo.rs`](notary/src/bin/notary_demo.rs). Those consume **your** ECDH output later.
+- Proving anything in zkVM, Ed25519 bundles, split AES-GCM (in [`notary/src/aes.rs`](notary/src/aes.rs)), or SP1 witness export (in [`notary_demo`](notary/src/bin/notary_demo.rs)). Those **consume** ECDH output; see [`DEMO.md`](DEMO.md) / [`INFO.md`](INFO.md).
 
 ---
 

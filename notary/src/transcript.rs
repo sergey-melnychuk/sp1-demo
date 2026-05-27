@@ -12,7 +12,7 @@ use crate::hkdf::{reference_empty_hash, reference_hkdf_expand_label, reference_h
 
 struct RawRecord {
     content_type: u8,
-    legacy_version: u16,
+    _legacy_version: u16,
     payload: Vec<u8>,
 }
 
@@ -29,7 +29,7 @@ fn parse_records(bytes: &[u8]) -> Option<Vec<RawRecord>> {
         }
         records.push(RawRecord {
             content_type: ct,
-            legacy_version: version,
+            _legacy_version: version,
             payload: bytes[pos..pos + length].to_vec(),
         });
         pos += length;
@@ -181,8 +181,7 @@ pub fn transcript_after_server_finished(
         if r.content_type != 0x17 || saw_server_finished {
             continue;
         }
-        let (plain, inner_ct) =
-            decrypt_hs_record(&server_hs_key, &server_hs_iv, server_hs_seq, r)?;
+        let (plain, inner_ct) = decrypt_hs_record(&server_hs_key, &server_hs_iv, server_hs_seq, r)?;
         server_hs_seq += 1;
         if append_hs_messages(&mut messages, &plain, inner_ct)? {
             saw_server_finished = true;
@@ -227,8 +226,7 @@ pub fn transcript_after_client_finished(
         if r.content_type != 0x17 || saw_server_finished {
             continue;
         }
-        let (plain, inner_ct) =
-            decrypt_hs_record(&server_hs_key, &server_hs_iv, server_hs_seq, r)?;
+        let (plain, inner_ct) = decrypt_hs_record(&server_hs_key, &server_hs_iv, server_hs_seq, r)?;
         server_hs_seq += 1;
         if append_hs_messages(&mut messages, &plain, inner_ct)? {
             saw_server_finished = true;
@@ -239,8 +237,7 @@ pub fn transcript_after_client_finished(
         if r.content_type != 0x17 || saw_client_finished {
             continue;
         }
-        let (plain, inner_ct) =
-            decrypt_hs_record(&client_hs_key, &client_hs_iv, client_hs_seq, r)?;
+        let (plain, inner_ct) = decrypt_hs_record(&client_hs_key, &client_hs_iv, client_hs_seq, r)?;
         client_hs_seq += 1;
         if append_hs_messages(&mut messages, &plain, inner_ct)? {
             saw_client_finished = true;
@@ -279,8 +276,7 @@ fn parse_cert_message(body: &[u8]) -> Option<Vec<Vec<u8>>> {
     if body.len().checked_sub(pos)? < 3 {
         return None;
     }
-    let list_len =
-        u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
+    let list_len = u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
     pos += 3;
     let list_end = pos.checked_add(list_len)?;
     if list_end > body.len() {
@@ -291,8 +287,7 @@ fn parse_cert_message(body: &[u8]) -> Option<Vec<Vec<u8>>> {
         if list_end.checked_sub(pos)? < 3 {
             return None;
         }
-        let cert_len =
-            u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
+        let cert_len = u32::from_be_bytes([0, body[pos], body[pos + 1], body[pos + 2]]) as usize;
         pos += 3;
         if list_end.checked_sub(pos)? < cert_len {
             return None;
@@ -323,8 +318,7 @@ pub fn cert_chain_ders_from_handshake(
         if r.content_type != 0x17 {
             continue;
         }
-        let (plain, inner_ct) =
-            decrypt_hs_record(&server_hs_key, &server_hs_iv, server_hs_seq, r)?;
+        let (plain, inner_ct) = decrypt_hs_record(&server_hs_key, &server_hs_iv, server_hs_seq, r)?;
         server_hs_seq += 1;
         if inner_ct != 22 {
             continue;
@@ -348,8 +342,8 @@ mod tests {
     };
     use rand::rngs::OsRng;
     use rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256;
-    use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
     use rustls::crypto::ring::default_provider;
+    use rustls::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
     use rustls::{ClientConfig, ClientConnection, Error, KeyLog, NamedGroup, RootCertStore};
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
@@ -460,7 +454,8 @@ mod tests {
         let host_share = generate_share(&mut OsRng);
         let notary_share = generate_share(&mut OsRng);
         let esk = combined_client_esk(&host_share, &notary_share);
-        let kx: &'static dyn SupportedKxGroup = Box::leak(Box::new(ExternalKxGroup { esk_client: esk }));
+        let kx: &'static dyn SupportedKxGroup =
+            Box::leak(Box::new(ExternalKxGroup { esk_client: esk }));
         let mut provider = default_provider();
         provider.kx_groups = vec![kx];
         provider.cipher_suites = vec![TLS13_AES_128_GCM_SHA256];
@@ -510,8 +505,7 @@ mod tests {
         let early = reference_hkdf_extract(&[0u8; 32], &[0u8; 32]);
         let derived1 = reference_hkdf_expand_label(&early, "derived", &empty, 32);
         let hs = reference_hkdf_extract(&derived1, &ikm.0);
-        let expect_server_hs =
-            reference_hkdf_expand_label(&hs, "s hs traffic", &after_sh, 32);
+        let expect_server_hs = reference_hkdf_expand_label(&hs, "s hs traffic", &after_sh, 32);
         assert_eq!(
             key_log.lock().unwrap().server_hs.as_ref(),
             Some(&expect_server_hs),
